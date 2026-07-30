@@ -14,6 +14,21 @@ PC VR only, via Link or Air Link. Not the standalone version.
 
 ---
 
+## See the difference
+
+Both crops are from the **outer part of the view**, taken at the same spot, shown at
+original resolution. This is what your eyes get whenever you are not staring dead
+ahead — which is most of the time.
+
+![Before and after, left side of the view](screenshots/comparison-left.png)
+
+![Before and after, right side of the view](screenshots/comparison-right.png)
+
+Look at the wall texture, the ivy, the paving stones, the dappled shadows — and the
+pictograms on the bins. Same scene, same settings, same frame budget.
+
+---
+
 ## Download and run
 
 1. Download the two files: `HitmanVRFoveationFix.ps1` and `HitmanVRFoveationFix.bat`
