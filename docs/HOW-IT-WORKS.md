@@ -36,8 +36,14 @@ software blur is the only thing left — and it is very visible.
 
 ## 2. What the fix does
 
-Switch the renderer to **two slices at full resolution**. Same pixel budget, spread
-evenly. Five instructions and three values:
+Switch the renderer to **two slices at full resolution**, covering the whole field of
+view. Five instructions and three values.
+
+Note on cost, since this is easy to get wrong: it is **twice** the pixel work, not
+the same. Each slice doubles in both dimensions while the slice count halves — four
+quarters against two wholes. What stays equal is the *density*: 936 px across the old
+~49° narrow zone is 19.1 px/°, and 1872 px across the full 99° is 18.9 px/°. About a
+percent apart. The old sweet-spot sharpness, everywhere.
 
 ### Before VR initialises
 

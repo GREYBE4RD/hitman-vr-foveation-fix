@@ -28,7 +28,7 @@ ahead — which is most of the time.
 ![Before and after, right side of the view](screenshots/comparison-right.png)
 
 Look at the wall texture, the ivy, the paving stones, the dappled shadows — and the
-pictograms on the bins. Same scene, same settings, same frame budget.
+pictograms on the bins. Same scene, same settings, same headset.
 
 ---
 
@@ -70,11 +70,25 @@ headset sharp enough to show the difference, the result is a small sharp island 
 sea of mush — and because the circle is fixed to the centre of the image and not to
 where you are looking, you spend most of your time looking at the blurry part.
 
-This tool switches the game to **two layers at full resolution**. The pixel budget
-stays the same, but it is spread evenly instead of being concentrated in the middle.
-The whole field of view ends up as sharp as that little circle used to be.
+This tool switches the game to **two layers at full resolution**, covering the whole
+field of view. There is no wide/narrow split left at all.
 
-No resolution setting is changed. Your frame rate should be roughly what it was.
+It costs **twice the pixel work**: before, four slices at 936 x 1008 each; after,
+two at 1872 x 2016. Same total field of view, twice the pixels. In testing the frame
+rate held up because the game is not GPU-bound at these resolutions, but that is a
+happy accident, not a free lunch.
+
+The number that does hold up is the pixel density:
+
+| | pixels | across | density |
+|---|---|---|---|
+| old sweet spot | 936 | ~49° | 19.1 px/° |
+| now, everywhere | 1872 | 99° | 18.9 px/° |
+
+About one percent apart. You get the old sweet-spot density — you just get it across
+the whole view instead of a small circle in the middle.
+
+No resolution setting is changed. You do not need to raise anything.
 
 ---
 
@@ -104,9 +118,10 @@ If anyone at IOI reads this: you are welcome to take this. No permission needed,
 credit needed, no strings. The whole change is five instructions and three values,
 all documented in [`docs/HOW-IT-WORKS.md`](docs/HOW-IT-WORKS.md).
 
-Two full-resolution layers instead of four half-resolution ones costs the same pixel
-work and looks dramatically better on modern headsets. It would be a lovely patch
-note.
+Two full-resolution layers instead of four half-resolution ones costs twice the
+pixel work and looks dramatically better on modern headsets — and on hardware that
+is not GPU-bound, which is most of it, that cost does not show. It would be a lovely
+patch note.
 
 ---
 
