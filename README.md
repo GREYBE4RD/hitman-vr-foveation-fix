@@ -106,6 +106,23 @@ note.
 
 ---
 
+## Reporting a problem
+
+If the tool does not go green, or something looks wrong, please
+[open an issue](https://github.com/RealChrizzl/hitman-vr-foveation-fix/issues) — and
+include **the exact wording the window showed you**. Grey, amber and red all say
+something different, and the message alone usually identifies the cause.
+
+For anything beyond that there is a read-only diagnostic in
+[`tools/`](tools/). Put `HitmanVRProbe.ps1` and `HitmanVRProbe.bat` in the same
+folder, start the game, get into VR and into a mission, double-click the `.bat` and
+press **Copy report**.
+
+It imports only `OpenProcess`, `ReadProcessMemory` and `CloseHandle` — no write
+function is declared at all, so it cannot modify the game even in principle.
+
+---
+
 ## For the curious
 
 - [`docs/HOW-IT-WORKS.md`](docs/HOW-IT-WORKS.md) — how the foveation works, what the
