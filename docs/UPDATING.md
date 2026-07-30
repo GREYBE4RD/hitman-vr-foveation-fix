@@ -53,6 +53,21 @@ shorten this pattern you will hit the wrong one.
 
 Patch the `movzbl` to `B8 01 00 00 00 90 90` = `mov eax,1` + two `nop`.
 
+### 3b. Field of view, OpenVR device — hit offset 44
+
+```
+50 09 00 00 45 33 C0 4C 8B 8E C8 7A 00 00 48 8B D3 48 89 6C 24 28
+48 89 6C 24 20 48 8B 01 FF 50 28 48 8B CB E8 ?? ?? ?? ?? FF 4B 14
+0F B6 87 1B 03 00 00
+```
+
+The twin of the pattern above, and the reason it needs those extra 44 bytes: this
+is the same method implemented separately in `ZRenderVRDeviceOpenVR`. Only the
+first four bytes differ — `+0x950` here against `+0x8C0` there. Same patch.
+
+Both must be applied. Patch one only and the other backend keeps a narrow field of
+view; the unused one never executes.
+
 ### 4. View count — hit offset 12
 
 ```
@@ -92,6 +107,11 @@ also finds `rel32` jump displacements and will roughly triple your hit count.
 
 Of those reads, the view count is the one that feeds a value of 1 / 2 / 4 onto a stack
 in the render context. It is the interesting one; see `HOW-IT-WORKS.md` §3.
+
+**The two device classes** sit at vtable slot `+0x208` each. If you need to find
+the pair again, look for pointers to the containing functions in `.rdata` — they
+land at `<device vtable> + 0x208` for `ZRenderVRDeviceOculus` and
+`ZRenderVRDeviceOpenVR` respectively.
 
 **The device fields** (`+0x319` active, `+0x420` field of view, `+0x490` scales,
 `+0x4C0` mask, `+0x4D8` transition, `+0x510/+0x514` eye size, `+0x520` layers,

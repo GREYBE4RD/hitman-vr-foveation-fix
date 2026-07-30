@@ -10,7 +10,10 @@ only thing left blurring the picture. On Fresnel headsets (Quest 2, Quest 3S, Ri
 it works too, the gain is just smaller because the lenses already soften the
 periphery.
 
-PC VR only, via Link or Air Link. Not the standalone version.
+PC VR only, not the standalone version. Both of the game's VR backends work:
+**Oculus** (Quest via Link or Air Link, Rift S) and **SteamVR** (anything on
+OpenVR, including Quest headsets over Steam Link or Virtual Desktop, and Vive,
+Index, Bigscreen Beyond and friends).
 
 ---
 
@@ -81,7 +84,8 @@ No resolution setting is changed. Your frame rate should be roughly what it was.
   nothing is left behind. Every change is made in the memory of the running process
   and disappears the moment you close HITMAN.
 - It refuses to do anything if the game code is not in its original state, if VR is
-  already running when it attaches, or if the headset is not on the Oculus runtime.
+  already running when it attaches, or if the VR device does not look the way it
+  expects.
 - Turning it off or closing the window restores everything.
 
 **Said plainly:** it does write to the memory of a game that has an online connection.
@@ -97,7 +101,7 @@ refuses instead of guessing.
 ## To IO Interactive
 
 If anyone at IOI reads this: you are welcome to take this. No permission needed, no
-credit needed, no strings. The whole change is four instructions and three values,
+credit needed, no strings. The whole change is five instructions and three values,
 all documented in [`docs/HOW-IT-WORKS.md`](docs/HOW-IT-WORKS.md).
 
 Two full-resolution layers instead of four half-resolution ones costs the same pixel

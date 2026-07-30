@@ -1,7 +1,8 @@
 # How it works
 
 Everything below refers to HITMAN 3 / World of Assassination build **3.270.1**,
-Windows, D3D11, Oculus (LibOVR) backend.
+Windows, D3D11. Both VR backends the game has are covered: Oculus (LibOVR) and
+SteamVR (OpenVR). It has no OpenXR backend at all.
 
 ---
 
@@ -36,7 +37,7 @@ software blur is the only thing left — and it is very visible.
 ## 2. What the fix does
 
 Switch the renderer to **two slices at full resolution**. Same pixel budget, spread
-evenly. Four instructions and three values:
+evenly. Five instructions and three values:
 
 ### Before VR initialises
 
@@ -44,11 +45,25 @@ evenly. Four instructions and three values:
 |---|---|---|---|
 | `0x011D8B9E` | `0F 94 C1` | `B1 00 90` | WNO flag writer A → 0 |
 | `0x011D8BC1` | `0F 94 C0` | `B0 00 90` | WNO flag writer B → 0 |
-| `0x012C1EAC` | `0F B6 87 1B 03 00 00` | `B8 01 00 00 00 90 90` | constant-buffer flag = 1, raises the shader's radius limit so the image fills the field of view instead of leaving a black border |
+| `0x012C1EAC` | `0F B6 87 1B 03 00 00` | `B8 01 00 00 00 90 90` | constant-buffer flag = 1, raises the shader's radius limit so the image fills the field of view instead of leaving a black border — **Oculus device** |
+| `0x012499CC` | `0F B6 87 1B 03 00 00` | `B8 01 00 00 00 90 90` | the same thing again for the **OpenVR device** |
 | `0x01161FE9` | `80 B8 1B 03 00 00 00` | `48 85 E4 90 90 90 90` | **view count 4** — see below |
 
 `48 85 E4` is `test %rsp,%rsp`. It clears the zero flag without touching any register,
 so the `cmovne` that follows always fires.
+
+The last two are the same method in two different classes. Both device classes
+carry it at vtable slot `+0x208`:
+
+```
+ZRenderVRDeviceOculus  vtable RVA 0x1F016C0  +0x208 -> 0x12C1CB0  (0x12C1EAC)
+ZRenderVRDeviceOpenVR  vtable RVA 0x1EFE020  +0x208 -> 0x12497D0  (0x12499CC)
+```
+
+Patch only one and the other backend keeps its narrow field of view. Everything
+else — the device layout, the field offsets, the other three patches — is shared
+between them, which was confirmed by comparing probe reports from both runtimes on
+the same machine.
 
 ### Once a mission is loaded
 

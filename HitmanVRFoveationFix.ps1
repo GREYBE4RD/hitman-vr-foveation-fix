@@ -1,5 +1,5 @@
 <#
-    HitmanVRFoveationFix  v1.1
+    HitmanVRFoveationFix  v1.2
     Edge-to-edge sharpness for HITMAN World of Assassination in PC VR.
 
     WHAT IT DOES
@@ -29,8 +29,18 @@
       missing, it refuses and changes nothing.
 
     SUPPORTED HEADSETS
-      Oculus runtime: Quest 2, Quest 3, Quest Pro, Rift S, via Link or Air Link.
-      NOT SteamVR / OpenVR - that is a different backend and is not patched.
+      Both VR backends the game speaks are supported:
+
+        Oculus  - Quest 2, Quest 3, Quest 3S, Quest Pro, Rift S, via Link or
+                  Air Link
+        SteamVR - anything that presents itself through OpenVR, including Quest
+                  headsets connected with Steam Link or Virtual Desktop
+
+      The device layout turned out to be identical between the two, so the same
+      values work for both. The code is not quite identical though: each backend
+      has its own device class with its own copy of one function, so that one is
+      patched twice, once per class. HITMAN has no OpenXR backend at all, so
+      launching through an OpenXR runtime lands on SteamVR anyway.
 
     WHAT IT TOUCHES
       Nothing on disk. No game file is modified, nothing is written next to the
@@ -96,7 +106,8 @@ $VERIFIED_TIMESTAMP    = 1781013974
 $MANAGER_RVA           = 0x03225D20L
 $MANAGER_VTABLE_RVA    = 0x01EF5398L
 $MANAGER_DEVICE_OFFSET = 0x141A0L
-$OCULUS_VTABLE_RVA     = 0x01F016C0L
+$OCULUS_VTABLE_RVA     = 0x01F016C0L    # ZRenderVRDeviceOculus
+$OPENVR_VTABLE_RVA     = 0x01EFE020L    # ZRenderVRDeviceOpenVR - same layout, verified by probe
 $VERIFIED_WNO_OFF      = 0x31BL
 
 $VERIFIED_CODE = @(
@@ -106,7 +117,10 @@ $VERIFIED_CODE = @(
   [pscustomobject]@{ RVA=0x011D8BC1L
                      Stock=[byte[]](0x0F,0x94,0xC0)
                      Fix  =[byte[]](0xB0,0x00,0x90) }
-  [pscustomobject]@{ RVA=0x012C1EACL
+  [pscustomobject]@{ RVA=0x012C1EACL          # field of view, Oculus device
+                     Stock=[byte[]](0x0F,0xB6,0x87,0x1B,0x03,0x00,0x00)
+                     Fix  =[byte[]](0xB8,0x01,0x00,0x00,0x00,0x90,0x90) }
+  [pscustomobject]@{ RVA=0x012499CCL          # field of view, OpenVR device
                      Stock=[byte[]](0x0F,0xB6,0x87,0x1B,0x03,0x00,0x00)
                      Fix  =[byte[]](0xB8,0x01,0x00,0x00,0x00,0x90,0x90) }
   [pscustomobject]@{ RVA=0x01161FE9L
@@ -126,7 +140,10 @@ $SIGS = @(
     What="two layers instead of four (writer B)" }
   [pscustomobject]@{ Hit=44; Fix=[byte[]](0xB8,0x01,0x00,0x00,0x00,0x90,0x90)
     Pattern="C0 08 00 00 45 33 C0 4C 8B 8E C8 7A 00 00 48 8B D3 48 89 6C 24 28 48 89 6C 24 20 48 8B 01 FF 50 28 48 8B CB E8 ?? ?? ?? ?? FF 4B 14 0F B6 87 1B 03 00 00"
-    What="full field of view instead of a black border" }
+    What="full field of view, Oculus device" }
+  [pscustomobject]@{ Hit=44; Fix=[byte[]](0xB8,0x01,0x00,0x00,0x00,0x90,0x90)
+    Pattern="50 09 00 00 45 33 C0 4C 8B 8E C8 7A 00 00 48 8B D3 48 89 6C 24 28 48 89 6C 24 20 48 8B 01 FF 50 28 48 8B CB E8 ?? ?? ?? ?? FF 4B 14 0F B6 87 1B 03 00 00"
+    What="full field of view, OpenVR device" }
   [pscustomobject]@{ Hit=12; Fix=[byte[]](0x48,0x85,0xE4,0x90,0x90,0x90,0x90)
     Pattern="74 16 49 8B 85 A0 41 01 00 41 8B CF 80 B8 1B 03 00 00 00 0F 45 CF"
     What="view count 4 - without this, geometry disappears" }
@@ -140,7 +157,6 @@ $SIG_DEVICE_DSP = 15
 $OFF_ACTIVE=0x319L; $OFF_TRANS=0x4D8L; $OFF_W=0x510L; $OFF_H=0x514L
 $OFF_LAYERS=0x520L; $OFF_TEX=0x530L
 $OFF_FOV=0x420L; $OFF_SCALE=0x490L; $OFF_MASK=0x4C0L
-[UInt32[]]$VERIFIED_FOV = 0x3FB02D48,0x3F56CF3B,0x3F773761,0x3FB6CD8D
 [UInt32[]]$SCALE_FIX    = 0x3F800000,0x3F800000,0x3F800000,0x3F800000
 [UInt32[]]$SCALE_STOCK  = 0x3EDF2BF0,0x3ECE8B44,0x4012D426,0x401EA625
 [byte[]]$MASK_FIX       = 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00
@@ -221,20 +237,24 @@ $script:devSlot=0L         # pattern path: RVA of the device pointer
 $script:wnoOff=$OFF_ACTIVE
 $script:patched=$false
 $script:dev=0L; $script:tex=0L; $script:valsOk=$false; $script:needRel=$false
+$script:scaleStock=$null; $script:maskStock=$null
 $script:fatal=""; $script:stopped=$false
 
 function Detach {
     if ($script:handle -ne [IntPtr]::Zero) { [HmFix]::CloseHandle($script:handle) | Out-Null }
     $script:handle=[IntPtr]::Zero; $script:gamePid=0; $script:base=0L
     $script:mode=""; $script:sites=@(); $script:devSlot=0L; $script:patched=$false
-    $script:dev=0L; $script:tex=0L; $script:valsOk=$false; $script:needRel=$false }
+    $script:dev=0L; $script:tex=0L; $script:valsOk=$false; $script:needRel=$false
+    $script:scaleStock=$null; $script:maskStock=$null }
 
 function Restore {
     if ($script:handle -eq [IntPtr]::Zero) { return }
     try {
         if ($script:valsOk -and $script:dev -ne 0) {
-            try { WB $script:handle ($script:dev+$OFF_SCALE) (W2B $SCALE_STOCK) } catch {}
-            try { WB $script:handle ($script:dev+$OFF_MASK)  $MASK_STOCK        } catch {} }
+            $sb = $script:scaleStock; if ($null -eq $sb) { $sb = W2B $SCALE_STOCK }
+            $mb = $script:maskStock;  if ($null -eq $mb) { $mb = $MASK_STOCK }
+            try { WB $script:handle ($script:dev+$OFF_SCALE) $sb } catch {}
+            try { WB $script:handle ($script:dev+$OFF_MASK)  $mb } catch {} }
         if ($script:patched) {
             foreach ($s in $script:sites) { try { WB $script:handle ($script:base+$s.RVA) $s.Stock } catch {} } }
         Log "restored"
@@ -290,7 +310,7 @@ $form.Controls.Add($btnStop)
 
 $link=New-Object Windows.Forms.LinkLabel
 $link.Location=New-Object Drawing.Point(240,260); $link.Size=New-Object Drawing.Size(260,22)
-$link.Text="v1.1 by RealChrizzl - project page"
+$link.Text="v1.2 by RealChrizzl - project page"
 $link.LinkArea=New-Object Windows.Forms.LinkArea(22,12)
 $link.TextAlign="MiddleRight"
 $link.Add_LinkClicked({ Start-Process "https://github.com/RealChrizzl/hitman-vr-foveation-fix" })
@@ -370,7 +390,9 @@ function Get-Dev {
         if ((I64 $script:handle $mgr) -ne ($script:base+$MANAGER_VTABLE_RVA)) { return 0L }
         $d=I64 $script:handle ($mgr+$MANAGER_DEVICE_OFFSET)
         if ($d -eq 0) { return 0L }
-        if ((I64 $script:handle $d) -ne ($script:base+$OCULUS_VTABLE_RVA)) { return -1L }
+        $vt = I64 $script:handle $d
+        if ($vt -ne ($script:base+$OCULUS_VTABLE_RVA) -and
+            $vt -ne ($script:base+$OPENVR_VTABLE_RVA)) { return -1L }
         return $d
     }
     try { $d = I64 $script:handle ($script:base+$script:devSlot) } catch { return 0L }
@@ -383,9 +405,10 @@ function VR-Running {
     if ($d -le 0) { return $false }
     try { return ((U8 $script:handle ($d+$OFF_ACTIVE)) -eq 1) } catch { return $false } }
 
-function Oculus-Loaded {
+# Either backend is fine - the device layout is identical, verified on both.
+function VR-Runtime-Loaded {
     try { foreach ($m in (Get-Process -Id $script:gamePid).Modules) {
-            if ($m.ModuleName -like "LibOVRRT*") { return $true } } } catch {}
+            if ($m.ModuleName -like "LibOVRRT*" -or $m.ModuleName -like "openvr_api*") { return $true } } } catch {}
     return $false }
 
 function Apply-Code {
@@ -446,7 +469,7 @@ $timer.Add_Tick({
 
         $d = Get-Dev
         if ($d -eq -1L) {
-            Show-State "red" "Unsupported headset" "The active VR backend is not the Oculus runtime. This tool only supports Quest and Rift headsets via Link or Air Link."
+            Show-State "red" "Unsupported backend" "The active VR device is neither the Oculus nor the SteamVR one this tool was verified against."
             return }
         if ($d -eq 0L) { Show-State "amber" "Ready - start VR" $ready $warn; return }
         $script:dev=$d
@@ -460,8 +483,8 @@ $timer.Add_Tick({
         $h     =U32 $script:handle ($d+$OFF_H)
 
         if ($active -ne 1) { Show-State "amber" "Ready - start VR" $ready $warn; return }
-        if ($script:mode -eq "scanned" -and -not (Oculus-Loaded)) {
-            Show-State "red" "Unsupported headset" "The Oculus runtime is not loaded. This tool only supports Quest and Rift headsets via Link or Air Link, not SteamVR."
+        if ($script:mode -eq "scanned" -and -not (VR-Runtime-Loaded)) {
+            Show-State "red" "No VR runtime" "Neither the Oculus nor the SteamVR runtime is loaded in the game."
             return }
         if ($wno -ne 0) {
             Show-State "red" "Not active" "VR started before the patch could take effect. Close HITMAN, start this tool first, then the game."
@@ -469,22 +492,27 @@ $timer.Add_Tick({
 
         if ($tex -ne $script:tex) { $script:tex=$tex; $script:needRel=$false; $script:valsOk=$false }
 
+        # The two backends report slightly different numbers here, so this is a
+        # plausibility check rather than an exact match: four tangent values that
+        # must sit in a sane range. Wrong layout fails it, a different headset
+        # does not.
         $fovOk=$false
         try {
-            if ($script:mode -eq "verified") {
-                $fovOk = Same (RB $script:handle ($d+$OFF_FOV) 16) (W2B $VERIFIED_FOV)
-            } else {
-                $fb = RB $script:handle ($d+$OFF_FOV) 16
-                $fovOk=$true
-                for ($i=0;$i -lt 4;$i++) {
-                    $f=[BitConverter]::ToSingle($fb,$i*4)
-                    if ($f -lt 0.2 -or $f -gt 3.0) { $fovOk=$false } } }
+            $fb = RB $script:handle ($d+$OFF_FOV) 16
+            $fovOk=$true
+            for ($i=0;$i -lt 4;$i++) {
+                $f=[BitConverter]::ToSingle($fb,$i*4)
+                if ($f -lt 0.2 -or $f -gt 3.0) { $fovOk=$false } }
         } catch {}
 
         if ($fovOk) {
             $sOk = Same (RB $script:handle ($d+$OFF_SCALE) 16) (W2B $SCALE_FIX)
             $mOk = Same (RB $script:handle ($d+$OFF_MASK) 8) $MASK_FIX
             if (-not ($sOk -and $mOk)) {
+                # remember what was actually there before touching it
+                if ($null -eq $script:scaleStock) {
+                    try { $script:scaleStock = RB $script:handle ($d+$OFF_SCALE) 16 } catch {}
+                    try { $script:maskStock  = RB $script:handle ($d+$OFF_MASK) 8 }  catch {} }
                 WB $script:handle ($d+$OFF_SCALE) (W2B $SCALE_FIX)
                 WB $script:handle ($d+$OFF_MASK)  $MASK_FIX
                 if ($trans -eq 3) { $script:needRel=$true }
