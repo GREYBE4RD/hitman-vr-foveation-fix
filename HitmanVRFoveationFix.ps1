@@ -9,9 +9,12 @@
       outside that circle is upscaled from the half-resolution layer, which is
       why it looks like mush on a high resolution headset.
 
-      This tool switches the game to two layers at full resolution instead. The
-      pixel budget stays the same, but it is spread evenly, so the whole field
-      of view becomes as sharp as the small centre circle used to be.
+      This tool switches the game to two layers at full resolution instead,
+      covering the whole field of view. That is twice the pixel work - four
+      quarter-sized slices against two full-sized ones - but the density is what
+      matters: 936 px across the old ~49 degree circle is 19.1 px per degree,
+      1872 px across the full 99 degrees is 18.9. About a percent apart. You get
+      the old sweet-spot sharpness, everywhere.
 
     HOW TO USE IT
       1. Start this tool
