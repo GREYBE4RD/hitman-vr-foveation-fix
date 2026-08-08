@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-HitmanVRFoveationFix v1.3 - Linux/Proton continuous-guard experiment
+HitmanVRFoveationFix v1.3 - Linux/Proton guarded
+Converted with the help of ChatGPT
 
 Direct port of RealChrizzl's Windows PowerShell v1.3 implementation.
 Renderer constants, verified RVAs, signatures, lifecycle logic, timing,
@@ -220,6 +221,9 @@ class HitmanVRFoveationFix:
         self.guard_thread: Optional[threading.Thread] = None
         self.guard_stop = threading.Event()
         self.guard_device = 0
+        self.state_lock = threading.Lock()
+        self.guard_write_pending = False
+        self.guard_write_transition = -1
 
     # --- basic helpers ------------------------------------------------------
 
@@ -428,22 +432,25 @@ class HitmanVRFoveationFix:
     # --- state helpers ------------------------------------------------------
 
     def reset_device_state(self, ownership_became_uncertain: bool = False) -> None:
-        if ownership_became_uncertain and (self.scale_touched or self.mask_touched):
-            self.device_restore_uncertain = True
+        with self.state_lock:
+            if ownership_became_uncertain and (self.scale_touched or self.mask_touched):
+                self.device_restore_uncertain = True
 
-        self.dev = 0
-        self.last_trans = -1
-        self.need_rel = False
-        self.pending_value_write = False
-        self.stable_ready = 0
-        self.stable_since = 0
-        self.scale_stock = None
-        self.mask_stock = None
-        self.scale_touched = False
-        self.mask_touched = False
-        self.runtime_loaded = False
-        self.last_runtime_check = 0
-        self.last_write_log = dt.datetime.min
+            self.dev = 0
+            self.last_trans = -1
+            self.need_rel = False
+            self.pending_value_write = False
+            self.stable_ready = 0
+            self.stable_since = 0
+            self.scale_stock = None
+            self.mask_stock = None
+            self.scale_touched = False
+            self.mask_touched = False
+            self.runtime_loaded = False
+            self.last_runtime_check = 0
+            self.last_write_log = dt.datetime.min
+            self.guard_write_pending = False
+            self.guard_write_transition = -1
 
     @staticmethod
     def advance_lifecycle(
@@ -1007,71 +1014,110 @@ class HitmanVRFoveationFix:
 
     def guard_loop(self, device: int) -> None:
         """
-        Experimental Linux-only continuous guard.
+        Linux-specific 1 ms guard.
 
-        Poll only the developer's v1.3 scale/mask fields at high frequency.
-        This is deliberately separate from the 15 ms lifecycle/status loop.
+        Starts only after sync_render_values() has validated the geometry
+        block. It protects the developer's v1.3 scale/mask values during
+        mission/save renderer rebuilds.
         """
-        scale_fix = SCALE_FIX
-        mask_fix = MASK_FIX
-
         while not self.guard_stop.is_set() and self.process_alive():
             try:
+                with self.state_lock:
+                    if self.guard_device != device or self.dev != device:
+                        return
+
                 if self.get_dev() != device:
                     return
 
+                wrote = False
+
                 scale = self.rb(device + OFF_SCALE, 16)
-                if scale != scale_fix:
-                    if not self.scale_touched:
-                        self.scale_stock = scale
-                    self.scale_touched = True
-                    self.wb(device + OFF_SCALE, scale_fix)
+                if scale != SCALE_FIX:
+                    with self.state_lock:
+                        if self.guard_device != device or self.dev != device:
+                            return
+                        if not self.scale_touched:
+                            self.scale_stock = scale
+                        self.scale_touched = True
+                    self.wb(device + OFF_SCALE, SCALE_FIX)
+                    wrote = True
 
                 mask = self.rb(device + OFF_MASK, 8)
-                if mask != mask_fix:
-                    if not self.mask_touched:
-                        self.mask_stock = mask
-                    self.mask_touched = True
-                    self.wb(device + OFF_MASK, mask_fix)
+                if mask != MASK_FIX:
+                    with self.state_lock:
+                        if self.guard_device != device or self.dev != device:
+                            return
+                        if not self.mask_touched:
+                            self.mask_stock = mask
+                        self.mask_touched = True
+                    self.wb(device + OFF_MASK, MASK_FIX)
+                    wrote = True
+
+                if wrote:
+                    try:
+                        transition = self.u32(device + OFF_TRANS)
+                    except Exception:
+                        transition = -1
+                    with self.state_lock:
+                        if self.guard_device == device and self.dev == device:
+                            self.guard_write_pending = True
+                            self.guard_write_transition = transition
 
             except Exception:
                 if not self.process_alive():
                     return
 
-            # Roughly 0.1 ms scheduler pause. Actual Linux scheduling granularity
-            # may be larger; this is an experiment, not a real-time guarantee.
-            #time.sleep(0.0001) # works but way too aggressive
-            time.sleep(0.001) # works
+            time.sleep(0.001)
 
     def ensure_guard(self, device: int) -> None:
-        if (
-            self.guard_thread is not None
-            and self.guard_thread.is_alive()
-            and self.guard_device == device
-        ):
-            return
+        with self.state_lock:
+            if (
+                self.guard_thread is not None
+                and self.guard_thread.is_alive()
+                and self.guard_device == device
+            ):
+                return
 
-        self.guard_stop.set()
-        if self.guard_thread is not None and self.guard_thread.is_alive():
-            self.guard_thread.join(timeout=0.1)
+        self.stop_guard()
 
-        self.guard_stop = threading.Event()
-        self.guard_device = device
-        self.guard_thread = threading.Thread(
-            target=self.guard_loop,
-            args=(device,),
-            name="hitman-foveation-guard",
-            daemon=True,
-        )
-        self.guard_thread.start()
+        with self.state_lock:
+            self.guard_stop = threading.Event()
+            self.guard_device = device
+            self.guard_write_pending = False
+            self.guard_write_transition = -1
+            thread = threading.Thread(
+                target=self.guard_loop,
+                args=(device,),
+                name="hitman-foveation-guard",
+                daemon=True,
+            )
+            self.guard_thread = thread
+
+        thread.start()
         self.log(f"continuous guard started for device 0x{device:X}")
 
     def stop_guard(self) -> None:
-        self.guard_stop.set()
-        if self.guard_thread is not None and self.guard_thread.is_alive():
-            self.guard_thread.join(timeout=0.2)
-        self.guard_thread = None
-        self.guard_device = 0
+        with self.state_lock:
+            stop_event = self.guard_stop
+            thread = self.guard_thread
+
+        stop_event.set()
+        if thread is not None and thread.is_alive():
+            thread.join()
+
+        with self.state_lock:
+            self.guard_thread = None
+            self.guard_device = 0
+            self.guard_write_pending = False
+            self.guard_write_transition = -1
+
+    def consume_guard_write(self) -> tuple[bool, int]:
+        with self.state_lock:
+            pending = self.guard_write_pending
+            transition = self.guard_write_transition
+            self.guard_write_pending = False
+            self.guard_write_transition = -1
+        return pending, transition
 
     # --- main 15 ms timer-equivalent tick ----------------------------------
 
@@ -1127,6 +1173,7 @@ class HitmanVRFoveationFix:
 
         if device == -1:
             if self.dev != 0:
+                self.stop_guard()
                 self.reset_device_state(True)
 
             self.show_state(
@@ -1148,14 +1195,14 @@ class HitmanVRFoveationFix:
 
         if device != self.dev:
             if self.dev != 0:
+                self.stop_guard()
                 self.reset_device_state(True)
             else:
                 self.reset_device_state(False)
 
-            self.dev = device
+            with self.state_lock:
+                self.dev = device
             self.log(f"VR device found at 0x{device:X}")
-
-        self.ensure_guard(device)
 
         active = self.u8(device + OFF_ACTIVE)
         wno = self.u8(device + self.wno_off)
@@ -1208,6 +1255,9 @@ class HitmanVRFoveationFix:
 
         sync = self.sync_render_values(device)
 
+        if sync.initialized and sync.fixed:
+            self.ensure_guard(device)
+
         if sync.wrote:
             self.pending_value_write = True
 
@@ -1231,6 +1281,12 @@ class HitmanVRFoveationFix:
                 "Close HITMAN, start this tool first, then the game.",
             )
             return
+
+        guard_wrote, guard_transition = self.consume_guard_write()
+        if guard_wrote:
+            self.pending_value_write = True
+            if guard_transition >= 0:
+                transition = guard_transition
 
         life = self.advance_lifecycle(
             self.last_trans,
@@ -1399,7 +1455,7 @@ def main() -> int:
     if os.geteuid() != 0:
         print(
             "This tool needs permission to read/write HITMAN's process memory.\n"
-            f"Run: sudo -E python3 {Path(__file__).resolve()}",
+            f"Run: sudo python3 {Path(__file__).resolve()}",
             file=sys.stderr,
         )
         return 2
@@ -1408,8 +1464,14 @@ def main() -> int:
     log_path = self_dir / "foveationfix.log"
 
     # Linux equivalent of Local\HitmanVRFoveationFix named mutex.
-    lock_path = Path("/tmp/HitmanVRFoveationFix.lock")
-    lock_file = lock_path.open("w")
+    # Use /run/lock because this process runs as root; refuse symlink traversal.
+    lock_path = Path("/run/lock/HitmanVRFoveationFix.lock")
+    lock_fd = os.open(
+        lock_path,
+        os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    lock_file = os.fdopen(lock_fd, "r+")
 
     try:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1445,7 +1507,7 @@ def main() -> int:
     signal.signal(signal.SIGINT, fix.stop)
     signal.signal(signal.SIGTERM, fix.stop)
 
-    print("HitmanVRFoveationFix v1.3 - Linux/Proton continuous-guard experiment")
+    print("HitmanVRFoveationFix v1.3 - Linux/Proton guarded")
     print("Leave this terminal open while you play. Press Ctrl+C to turn off and restore.")
 
     rc = fix.run()
