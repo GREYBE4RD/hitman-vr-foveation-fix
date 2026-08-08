@@ -44,6 +44,10 @@ pictograms on the bins. Same scene, same settings, same headset.
 
 Leave the small window open while you play.
 
+The window tells you what is going on: grey while it waits for the game,
+amber while VR or a mission is still loading, **green when the fix is active**. If
+something is wrong it turns red and says what.
+
 ### Why a .bat and not an .exe
 
 Reading another program's memory is exactly what a debugger does — and also what
@@ -58,7 +62,6 @@ script next to it.
 
 1. Download the two files: `Linux-HitmanVRFoveationFix-v1.3.py` and `launch.linux.HitmanVRFoveationFix-v1.3.sh`
    — keep them in the same folder
-
 2. Make the launcher executable:
 
    ```bash
@@ -72,32 +75,23 @@ script next to it.
    ```
 
 4. Enter your `sudo` password when prompted
-
 5. Start HITMAN however you normally do, including straight into VR
-
 6. Play
 
-Leave the terminal open while you play. Press `Ctrl+C` to stop the fix and restore any live changes where possible.
-
-> **SteamVR / OpenVR:** v1.3 replaces the timing-sensitive v1.2 reload logic and has
-> been visually verified in the headset across new missions, mission restarts,
-> save-game loads, scene changes and Freelancer mode.
->
-> **Linux / Proton:** the Linux port uses the same v1.3 patches and renderer values,
-> with Linux process-memory access in place of the Windows APIs. A Linux-specific
-> 1 ms guard monitors the renderer scale and mask values because Proton can restore
-> them during save-game loads faster than the normal 15 ms lifecycle loop can catch.
-
-On Windows, the window tells you what is going on: grey while it waits for the game,
-amber while VR or a mission is still loading, **green when the fix is active**. If
-something is wrong it turns red and says what.
+Leave the terminal open while you play. Press `Ctrl+C` to stop the fix and restore any live changes.
 
 On Linux, the same states are reported in the terminal.
+
+> **Linux/Proton/SteamVR:** v1.3 replaces the timing-sensitive v1.2 reload logic and has
+> been visually verified in the headset across new missions, mission restarts, and
+> save-game loads. The port uses the same v1.3 patches and renderer
+> values, with Linux process-memory access in place of the Windows APIs. A Linux-specific
+> 1 ms guard monitors the renderer scale and mask values because Proton can restore them
+> during save-game loads faster than the normal 15 ms lifecycle loop can catch.
 
 The Linux launcher serves the same purpose: it changes to the folder containing the
 script and starts `Linux-HitmanVRFoveationFix-v1.3.py` with the privileges required
 to access HITMAN's process memory.
-
 
 ---
 
