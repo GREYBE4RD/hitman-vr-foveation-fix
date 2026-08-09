@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
+# Linux port developed with assistance from ChatGPT.
 """
-HitmanVRFoveationFix v1.3 - Linux/Proton guarded
-Converted with the help of ChatGPT
+HitmanVRFoveationFix v1.3.3 - Linux/Proton
 
 Direct port of RealChrizzl's Windows PowerShell v1.3 implementation.
 Renderer constants, verified RVAs, signatures, lifecycle logic, timing,
@@ -26,6 +26,7 @@ import fcntl
 import math
 import os
 import signal
+import stat
 import struct
 import sys
 import time
@@ -222,16 +223,24 @@ class HitmanVRFoveationFix:
         self.guard_stop = threading.Event()
         self.guard_device = 0
         self.state_lock = threading.Lock()
+        self.render_lock = threading.Lock()
         self.guard_write_pending = False
-        self.guard_write_transition = -1
+        self.guard_write_during_transition3 = False
 
     # --- basic helpers ------------------------------------------------------
 
     def log(self, text: str) -> None:
         try:
             stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            with self.log_path.open("a", encoding="utf-8") as f:
-                f.write(f"{stamp}  {text}\n")
+            flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(self.log_path, flags, 0o600)
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode):
+                    raise OSError("log path is not a regular file")
+                os.write(fd, f"{stamp}  {text}\n".encode("utf-8"))
+            finally:
+                os.close(fd)
         except OSError:
             pass
 
@@ -450,7 +459,7 @@ class HitmanVRFoveationFix:
             self.last_runtime_check = 0
             self.last_write_log = dt.datetime.min
             self.guard_write_pending = False
-            self.guard_write_transition = -1
+            self.guard_write_during_transition3 = False
 
     @staticmethod
     def advance_lifecycle(
@@ -697,6 +706,10 @@ class HitmanVRFoveationFix:
     # --- renderer values ----------------------------------------------------
 
     def sync_render_values(self, device: int) -> SyncResult:
+        with self.render_lock:
+            return self._sync_render_values_locked(device)
+
+    def _sync_render_values_locked(self, device: int) -> SyncResult:
         """
         Direct port of v1.3 Sync-RenderValues.
         """
@@ -1017,8 +1030,8 @@ class HitmanVRFoveationFix:
         Linux-specific 1 ms guard.
 
         Starts only after sync_render_values() has validated the geometry
-        block. It protects the developer's v1.3 scale/mask values during
-        mission/save renderer rebuilds.
+        block. During subsequent renderer rebuilds it reuses the same locked
+        v1.3 validation/write/verify/rollback routine as the main loop.
         """
         while not self.guard_stop.is_set() and self.process_alive():
             try:
@@ -1029,39 +1042,24 @@ class HitmanVRFoveationFix:
                 if self.get_dev() != device:
                     return
 
-                wrote = False
+                # Use the same complete render transaction as the main loop.
+                # _sync_render_values_locked() performs initialization/range
+                # validation, ownership capture, writes, verification and
+                # rollback. render_lock prevents overlap with the main loop.
+                with self.render_lock:
+                    result = self._sync_render_values_locked(device)
 
-                scale = self.rb(device + OFF_SCALE, 16)
-                if scale != SCALE_FIX:
-                    with self.state_lock:
-                        if self.guard_device != device or self.dev != device:
-                            return
-                        if not self.scale_touched:
-                            self.scale_stock = scale
-                        self.scale_touched = True
-                    self.wb(device + OFF_SCALE, SCALE_FIX)
-                    wrote = True
-
-                mask = self.rb(device + OFF_MASK, 8)
-                if mask != MASK_FIX:
-                    with self.state_lock:
-                        if self.guard_device != device or self.dev != device:
-                            return
-                        if not self.mask_touched:
-                            self.mask_stock = mask
-                        self.mask_touched = True
-                    self.wb(device + OFF_MASK, MASK_FIX)
-                    wrote = True
-
-                if wrote:
+                if result.wrote:
                     try:
                         transition = self.u32(device + OFF_TRANS)
                     except Exception:
                         transition = -1
+
                     with self.state_lock:
                         if self.guard_device == device and self.dev == device:
                             self.guard_write_pending = True
-                            self.guard_write_transition = transition
+                            if transition == 3:
+                                self.guard_write_during_transition3 = True
 
             except Exception:
                 if not self.process_alive():
@@ -1084,7 +1082,7 @@ class HitmanVRFoveationFix:
             self.guard_stop = threading.Event()
             self.guard_device = device
             self.guard_write_pending = False
-            self.guard_write_transition = -1
+            self.guard_write_during_transition3 = False
             thread = threading.Thread(
                 target=self.guard_loop,
                 args=(device,),
@@ -1109,15 +1107,15 @@ class HitmanVRFoveationFix:
             self.guard_thread = None
             self.guard_device = 0
             self.guard_write_pending = False
-            self.guard_write_transition = -1
+            self.guard_write_during_transition3 = False
 
-    def consume_guard_write(self) -> tuple[bool, int]:
+    def consume_guard_write(self) -> tuple[bool, bool]:
         with self.state_lock:
             pending = self.guard_write_pending
-            transition = self.guard_write_transition
+            during_transition3 = self.guard_write_during_transition3
             self.guard_write_pending = False
-            self.guard_write_transition = -1
-        return pending, transition
+            self.guard_write_during_transition3 = False
+        return pending, during_transition3
 
     # --- main 15 ms timer-equivalent tick ----------------------------------
 
@@ -1282,18 +1280,23 @@ class HitmanVRFoveationFix:
             )
             return
 
-        guard_wrote, guard_transition = self.consume_guard_write()
+        guard_wrote, guard_wrote_during_transition3 = self.consume_guard_write()
         if guard_wrote:
             self.pending_value_write = True
-            if guard_transition >= 0:
-                transition = guard_transition
 
+        # Always advance transition tracking with the actual renderer state.
         life = self.advance_lifecycle(
             self.last_trans,
             self.need_rel,
             transition,
             self.pending_value_write,
         )
+
+        # A guard write seen during transition 3 must latch the reload
+        # requirement even if the renderer has moved to transition 1/2 before
+        # the 15 ms main loop consumes it. Keep this separate from last_trans.
+        if guard_wrote_during_transition3:
+            life.need_reload = True
 
         if life.transition_changed:
             self.log(f"transition {self.last_trans} -> {transition}")
@@ -1439,7 +1442,7 @@ class HitmanVRFoveationFix:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Linux/Proton port of HitmanVRFoveationFix v1.3"
+        description="Linux/Proton port of HitmanVRFoveationFix v1.3.3"
     )
     parser.add_argument(
         "--process-name",
@@ -1455,7 +1458,7 @@ def main() -> int:
     if os.geteuid() != 0:
         print(
             "This tool needs permission to read/write HITMAN's process memory.\n"
-            f"Run: sudo python3 {Path(__file__).resolve()}",
+            f"Run: sudo python3 -I {Path(__file__).resolve()}",
             file=sys.stderr,
         )
         return 2
@@ -1464,8 +1467,8 @@ def main() -> int:
     log_path = self_dir / "foveationfix.log"
 
     # Linux equivalent of Local\HitmanVRFoveationFix named mutex.
-    # Use /run/lock because this process runs as root; refuse symlink traversal.
-    lock_path = Path("/run/lock/HitmanVRFoveationFix.lock")
+    # Use root-controlled /run because this process runs as root; refuse symlink traversal.
+    lock_path = Path("/run/HitmanVRFoveationFix.lock")
     lock_fd = os.open(
         lock_path,
         os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
@@ -1507,7 +1510,7 @@ def main() -> int:
     signal.signal(signal.SIGINT, fix.stop)
     signal.signal(signal.SIGTERM, fix.stop)
 
-    print("HitmanVRFoveationFix v1.3 - Linux/Proton guarded")
+    print("HitmanVRFoveationFix v1.3.3 - Linux/Proton")
     print("Leave this terminal open while you play. Press Ctrl+C to turn off and restore.")
 
     rc = fix.run()
