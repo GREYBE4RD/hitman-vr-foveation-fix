@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Linux port developed with assistance from ChatGPT.
 """
-HitmanVRFoveationFix for Linux based on windows version v1.3 - Linux/Proton itteration v1.3.3
+HitmanVRFoveationFix port for Linux/Proton v1.3.3 - based on Windows/PowerShell version v1.3
 
 Direct port of RealChrizzl's Windows PowerShell v1.3 implementation.
 Renderer constants, verified RVAs, signatures, lifecycle logic, timing,
@@ -1442,7 +1442,7 @@ class HitmanVRFoveationFix:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Linux/Proton port of HitmanVRFoveationFix v1.3.3"
+        description="Linux/Proton port v1.3.3 of HitmanVRFoveationFix v1.3"
     )
     parser.add_argument(
         "--process-name",
@@ -1510,7 +1510,7 @@ def main() -> int:
     signal.signal(signal.SIGINT, fix.stop)
     signal.signal(signal.SIGTERM, fix.stop)
 
-    print("HitmanVRFoveationFix v1.3.3 - Linux/Proton")
+    print("HitmanVRFoveationFix v1.3 - Linux/Proton itteration v1.3.3")
     print("Leave this terminal open while you play. Press Ctrl+C to turn off and restore.")
 
     rc = fix.run()
