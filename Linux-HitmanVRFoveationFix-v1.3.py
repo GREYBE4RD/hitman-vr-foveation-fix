@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Linux port developed with assistance from ChatGPT.
 """
-HitmanVRFoveationFix v1.3.3 - Linux/Proton
+HitmanVRFoveationFix for Linux based on windows version v1.3 - Linux/Proton itteration v1.3.3
 
 Direct port of RealChrizzl's Windows PowerShell v1.3 implementation.
 Renderer constants, verified RVAs, signatures, lifecycle logic, timing,
