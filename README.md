@@ -58,7 +58,11 @@ click past a virus warning. A plain script you can read is more honest.
 The `.bat` is one line. Open it in Notepad if you like; it does nothing but start the
 script next to it.
 
+---
+
 ### Linux / Proton
+
+**Linux port status:** This is an experimental Linux/Python port of the Windows/PowerShell v1.3 release. Development and testing of the Python port were carried out by GREYBE4RD, with assistance from ChatGPT, on Arch Linux with SwayWM (Wayland), SteamVR, and an AMD Radeon RX 9070 XT. While the port should be largely distro and hardware-agnostic, behaviour on other distributions, desktop environments, hardware configurations, and VR setups may vary.
 
 1. Download the two files: `Linux-HitmanVRFoveationFix-v1.3.py` and `launch.linux.HitmanVRFoveationFix-v1.3.sh`
    — keep them in the same folder
@@ -82,16 +86,9 @@ Leave the terminal open while you play. Press `Ctrl+C` to stop the fix and resto
 
 On Linux, the same states are reported in the terminal.
 
-> **Linux/Proton/SteamVR:** v1.3 replaces the timing-sensitive v1.2 reload logic and has
-> been visually verified in the headset across new missions, mission restarts, and
-> save-game loads. The port uses the same v1.3 patches and renderer
-> values, with Linux process-memory access in place of the Windows APIs. A Linux-specific
-> 1 ms guard monitors the renderer scale and mask values because Proton can restore them
-> during save-game loads faster than the normal 15 ms lifecycle loop can catch.
+> Linux/Proton/SteamVR: v1.3 replaces the timing-sensitive v1.2 reload logic and has been visually verified in the headset across new missions, mission restarts, and save-game loads. The Linux port uses the same v1.3 patches and renderer values, with Linux process-memory access in place of the Windows APIs. A Linux-specific 1 ms guard monitors the renderer scale and mask values because Proton can restore them during save-game loads faster than the normal 15 ms lifecycle loop can catch. The guard uses the same validated render-value routine as the main loop, shares the same synchronization and rollback handling, and feeds its writes into the existing v1.3 reload lifecycle.
 
-The Linux launcher serves the same purpose: it changes to the folder containing the
-script and starts `Linux-HitmanVRFoveationFix-v1.3.py` with the privileges required
-to access HITMAN's process memory.
+The Linux launcher serves the same purpose: it changes to the folder containing the script and starts `Linux-HitmanVRFoveationFix-v1.3.py` with the privileges required to access HITMAN's process memory.
 
 ---
 
