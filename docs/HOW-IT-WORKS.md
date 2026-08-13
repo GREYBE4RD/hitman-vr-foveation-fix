@@ -81,17 +81,26 @@ the same machine.
 
 OpenVR rebuilds the render state during mission, scene, and save-game loads. These
 fields must therefore be neutralised before that state reaches transition 3, not
-merely after a new texture pointer appears. v1.3 watches the transition at 15 ms,
-writes as soon as the device geometry is plausible (including before `active=1`),
-reads the values back, and requires multiple samples plus a 250 ms monotonic stable
-window before showing green. A write first observed after transition 3 remains amber
-and asks for one real reload.
+merely after a new texture pointer appears. The normal lifecycle still watches the
+transition at 15 ms, writes as soon as the device geometry is plausible (including
+before `active=1`), reads the values back, and requires multiple samples plus a
+250 ms monotonic stable window before showing green.
+
+Windows v1.4 also starts a separate sleeping guard after the first successful
+`Initialized && Fixed` renderer transaction. Its one-millisecond fast path reads only
+`device+0x490` (16 bytes) and `device+0x4C0` (8 bytes). Matching values cause no
+write and no UI work. A mismatch posts one callback to the WinForms thread and that
+callback reuses the complete validation, ownership, write, verification and rollback
+routine above. The 15 ms timer and callback therefore cannot write concurrently.
+
+If that guard transaction writes while transition 3 is visible, v1.4 records the
+fact in a separate latch. The latch survives a later 15 ms sample of transition 1 or
+2 and is cleared only after the newly observed load cycle reaches transition 3. This
+closes the save-load window without turning the whole UI/lifecycle timer into a
+one-millisecond busy loop.
 
 This lifecycle has been visually verified in the headset across new missions,
-mission restarts, save-game loads, scene changes and Freelancer mode. Polling is
-still not the same as synchronising with the render thread; if a future game build
-reintroduces a fast-load race, the next step is to re-derive and patch the scale/mask
-producer or constant-buffer builder from that build's binary.
+mission restarts, save-game loads, scene changes and Freelancer mode.
 
 Stock values for reference: `+0x490…` = `3EDF2BF0 3ECE8B44 4012D426 401EA625`,
 `+0x4C0/+0x4C4` = `3D 2D 66 3F  DA B9 4D 3E`.
@@ -124,13 +133,55 @@ A **count**, pushed onto a stack in the render context: 1 without VR, 2 with WNO
 4 with WNO on. Whatever consumes it does not cope with 2. Force it to 4 and the
 geometry stays put.
 
-This is safe even though only two views exist, because the central view-matrix
-accessor at `0x1306EFC` masks every requested index with `& 1` when WNO is off — a
-request for view 2 returns view 0. The fallback was already in the code.
+This is correct for geometry even though only two physical eye views exist: the
+central view-matrix accessor at `0x1306EFC` masks requested indices with `& 1` when
+WNO is off, so view 2 maps to eye 0 and view 3 maps to eye 1. v1.4 documents and
+handles the important exception: `CopyRefractionDepth` consumes the numeric context
+count through a fullscreen instance multiplier and therefore must see 2, not 4.
 
 ---
 
-## 4. How it was found
+## 4. Why glass and water need two physical views
+
+v1.3 deliberately keeps the render-context count at four because geometry and
+visibility break at two. Most of the renderer can map logical views 2 and 3 back to
+physical eyes 0 and 1, but the refraction-depth copy multiplies its fullscreen draw
+range by the current context count. That caused the narrow foveal views to leak into
+glass, flowing water, bottles and some emissive/light materials.
+
+v1.4 leaves the outer `DrawRefractiveAndTransparent` pass at four. A small owner
+scope identifies that exact pass, and only its two direct calls to
+`CopyRefractionDepth` temporarily replace the current count 4 with 2. Each wrapper
+restores 4 before returning. The changed call blocks on build 3.270.1 are:
+
+| Address | Role |
+|---|---|
+| `0x011B892A` | owner scope around `DrawRefractiveAndTransparent` |
+| `0x01290BA2` | first `CopyRefractionDepth` call, local 4 -> 2 -> 4 |
+| `0x01291386` | second `CopyRefractionDepth` call, local 4 -> 2 -> 4 |
+
+The wrappers gate on thread ID, render-context pointer and the expected current count.
+Their counters are monitored by the normal 15 ms loop. Installation and live removal
+suspend the game threads, reject any thread whose instruction pointer lies in a
+changed block or wrapper, and publish inner calls before the outer owner gate. Removal
+uses the reverse order.
+
+This exact split was selected by the Test W result: stereo glass and water became
+correct, the simultaneous pop-in disappeared, affected lights became stable, and no
+new global image problem was observed across the reported scenes.
+
+Implementation note: these are private executable wrappers allocated by the external
+PowerShell tool. They use normal Windows x64 calling convention and balanced
+CALL/RET control flow, but an external tool cannot register process-local dynamic
+unwind metadata without executing a registration call inside HITMAN. The normal path
+has been exercised extensively; an actual exception unwinding out of one of the
+wrapped render functions remains a rare release limitation. The cave is never freed
+while the process is alive, and live removal is allowed only after active counters and
+all suspended thread instruction pointers prove it is quiescent.
+
+---
+
+## 5. How it was found
 
 Six hypotheses were tested and all six were wrong: the skipped halving of the render
 target, the Hi-Z buffer (which turned out to belong to screen-space reflections, not

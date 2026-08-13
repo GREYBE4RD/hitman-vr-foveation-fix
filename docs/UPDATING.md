@@ -94,6 +94,42 @@ Two things are read out of this match rather than assumed:
 
 ## If a pattern no longer matches
 
+### v1.4 refraction call patterns
+
+v1.4 adds three strong patterns. The five-byte `E8` displacement is wildcarded,
+decoded, and range-checked. The two inner patterns must resolve to the same target.
+
+Outer owner scope, hit offset 0, replaced length 18:
+
+```
+48 8B 8C 24 C0 00 00 00 48 89 44 24 20 E8 ?? ?? ?? ??
+48 8D 8C 24 60 02 00 00
+```
+
+First `CopyRefractionDepth` call, hit offset 18, replaced length 21:
+
+```
+48 8B 8D B0 01 00 00 48 8D 95 D0 01 00 00 89 44 24 28
+4D 8B C4 8B 41 04 44 8B 09 48 8B CE 89 44 24 20 E8 ?? ?? ?? ??
+48 8B 9D D0 01 00 00 48 8B F8 48 8B 0D ?? ?? ?? ??
+4C 8D 0D ?? ?? ?? ??
+```
+
+Second call, also hit offset 18 and length 21:
+
+```
+48 8B 8D B0 01 00 00 48 8D 95 D0 01 00 00 89 44 24 28
+4D 8B C4 8B 41 04 44 8B 09 48 8B CE 89 44 24 20 E8 ?? ?? ?? ??
+48 8B 9D D0 01 00 00 48 8B F8 48 8B 85 B0 01 00 00
+4C 8B 40 60 4D 85 C0
+```
+
+Do not patch the shared fullscreen helper globally. The outer wrapper is an owner
+marker only; it does not change the context count. Each inner wrapper changes the
+current slot from 4 to 2 only for its direct call, then verifies and restores 4.
+
+---
+
 Work from what the code *does*, not from where it was.
 
 **Writers A and B** are the only places that store to `device+WNO`. Find every
@@ -124,12 +160,16 @@ have to be re-derived from the builder function.
 
 ## Verifying a change
 
-There is no substitute for putting the headset on. Two checks that matter:
+There is no substitute for putting the headset on. Three checks that matter:
 
 1. **Sharpness** — the whole field of view should look like the centre used to. The
    status window should show two layers at the full per-eye size, not half.
 2. **Geometry** — stand somewhere busy and move your head *and your position*. Nothing
    should pop in and out. If it does, the view count patch is not taking effect.
+3. **Transparency and refraction** — check glass panes, NPC glasses, flowing water,
+   bottles, emissive lights and at least one large panorama window while turning and
+   leaning your head. Both eyes must agree, and affected objects must not pop in both
+   eyes together or switch brightness with head angle.
 
-The second check is the one that is easy to skip and expensive to get wrong. It is
-what took the longest to find in the first place.
+The second and third checks are easy to skip and expensive to get wrong. They are
+what took the longest to isolate in the first place.

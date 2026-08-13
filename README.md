@@ -2,33 +2,40 @@
 
 **Edge-to-edge sharpness for HITMAN World of Assassination in PC VR.**
 
-If everything outside the middle of your view looks like mush, this fixes it.
+If the middle of the image looks sharp and everything around it turns to mush, this fixes that.
 
-The effect is most obvious on pancake-lens headsets — **Quest 3 and Quest Pro** —
-because their optics are sharp all the way to the edge, so the software blur is the
-only thing left blurring the picture. On Fresnel headsets (Quest 2, Quest 3S, Rift S)
-it works too, the gain is just smaller because the lenses already soften the
-periphery.
+Windows **v1.4** also fixes the eye-to-eye mismatch that could make glass, flowing water, bottles and some lights look different in each eye.
 
-PC VR only, not the standalone version. Both of the game's VR backends are supported
-and verified: **Oculus** (Quest via Link or Air Link, Rift S) and **SteamVR / OpenVR**
-(including headsets connected through Steam Link, Virtual Desktop or their native
-PC streaming software).
+There was one more wrinkle: simply reducing the renderer to two views also caused angle-dependent geometry pop-in around glass. v1.4 avoids that by keeping the normal four-view renderer for geometry and visibility, while using only the two physical eye views for the two `CopyRefractionDepth` calls.
+
+It also has a small renderer guard for the brief save-load window where the game could restore the old values and bring the black foveation circles back.
+
+The difference is easiest to see on pancake-lens headsets such as **Quest 3 and Quest Pro**. Their lenses stay sharp much farther towards the edges, so when the edge is blurry, you are mostly looking at the game's software blur.
+
+It works on Fresnel headsets too — Quest 2, Quest 3S, Rift S — but the difference is harder to see because the lenses already blur the edges.
+
+PC VR only. This does **not** work with the standalone version.
+
+Both VR backends are supported and tested:
+
+- **Oculus** — Quest via Link or Air Link, Rift S
+- **SteamVR / OpenVR** — including headsets connected through Steam Link, Virtual Desktop or their normal PC streaming software
 
 ---
 
 ## See the difference
 
-Both crops are from the **outer part of the view**, taken at the same spot, shown at
-original resolution. This is what your eyes get whenever you are not staring dead
-ahead — which is most of the time.
+Both crops come from the **outer part of the view**, from the same spot and at original resolution.
+
+This is the part of the image you are looking through whenever you move your eyes away from dead centre. Which, unsurprisingly, happens quite a lot.
 
 ![Before and after, left side of the view](screenshots/comparison-left.png)
 
 ![Before and after, right side of the view](screenshots/comparison-right.png)
 
-Look at the wall texture, the ivy, the paving stones, the dappled shadows — and the
-pictograms on the bins. Same scene, same settings, same headset.
+Look at the wall texture, ivy, paving stones, dappled shadows and the pictograms on the bins.
+
+Same scene. Same settings. Same headset.
 
 ---
 
@@ -36,158 +43,265 @@ pictograms on the bins. Same scene, same settings, same headset.
 
 ### Windows
 
-1. Download the two files: `HitmanVRFoveationFix.ps1` and `HitmanVRFoveationFix.bat`
-   — keep them in the same folder
-2. Double-click **`HitmanVRFoveationFix.bat`** and allow the administrator prompt
+1. Download `HitmanVRFoveationFix.ps1` and `HitmanVRFoveationFix.bat`
+   — keep both files in the same folder
+2. Double-click **`HitmanVRFoveationFix.bat`** and accept the administrator prompt
 3. Start HITMAN however you normally do, including straight into VR
 4. Play
 
 Leave the small window open while you play.
 
-The window tells you what is going on: grey while it waits for the game,
-amber while VR or a mission is still loading, **green when the fix is active**. If
-something is wrong it turns red and says what.
+It tells you what the tool is doing:
+
+- grey: waiting for HITMAN
+- amber: VR or the mission is still loading
+- **green: the fix is active**
+- red: something went wrong, and the window tells you what
+
+The normal UI and lifecycle loop runs every 15 ms.
+
+Once the renderer has been fully validated, v1.4 starts a separate sleeping guard which checks only two tiny pieces of renderer state: the 16-byte scale field and the 8-byte mask field, roughly once per millisecond.
+
+If those bytes are already correct, it does nothing.
+
+If they change, the guard hands control back to the same full validation, ownership, write, verification and rollback path used by the normal loop. There is no second "just write it and hope" code path hiding underneath.
 
 ### Why a .bat and not an .exe
 
-Reading another program's memory is exactly what a debugger does — and also what
-malware does. Packed PowerShell executables get flagged by antivirus software as a
-category, regardless of what is inside them, so shipping one would mean asking you to
-click past a virus warning. A plain script you can read is more honest.
+Reading another program's memory is what debuggers do.
 
-The `.bat` is one line. Open it in Notepad if you like; it does nothing but start the
-script next to it.
+It is also what malware does.
+
+Packed PowerShell executables therefore have a habit of making antivirus software very excited, regardless of what is actually inside them. Shipping one would mostly result in me asking people to click past a virus warning. Great first impression.
+
+So this comes as a plain PowerShell script instead. Open it in any text editor and you can see what it does.
+
+The `.bat` is one line. It only starts the script sitting next to it.
 
 ---
 
 ### Linux / Proton
 
-**Linux port status:** This is an experimental Linux/Python port of the Windows/PowerShell v1.3 release. Development and testing of the Python port were carried out by GREYBE4RD, with assistance from ChatGPT, on Arch Linux with SwayWM (Wayland), SteamVR, and an AMD Radeon RX 9070 XT. While the port should be largely distro and hardware-agnostic, behaviour on other distributions, desktop environments, hardware configurations, and VR setups may vary.
+**Linux port status:** experimental.
 
-1. Download the two files: `Linux-HitmanVRFoveationFix-v1.3.py` and `launch.linux.HitmanVRFoveationFix-v1.3.sh`
-   — keep them in the same folder
+This is a Linux/Python port of the Windows/PowerShell **v1.3** release.
+
+Development and testing were done by **GREYBE4RD**, with assistance from ChatGPT, on:
+
+- Arch Linux
+- SwayWM / Wayland
+- SteamVR
+- AMD Radeon RX 9070 XT
+
+Nothing in the port is supposed to depend specifically on that distro or GPU, but it has not been tested across every Linux distribution, desktop environment, graphics card and VR setup in existence. Expect some variation.
+
+1. Download `Linux-HitmanVRFoveationFix-v1.3.py` and `launch.linux.HitmanVRFoveationFix-v1.3.sh`
+   — keep both files in the same folder
 2. Make the launcher executable:
 
    ```bash
    chmod +x launch.linux.HitmanVRFoveationFix-v1.3.sh
    ```
 
-3. Run the launcher:
+3. Run it:
 
    ```bash
    ./launch.linux.HitmanVRFoveationFix-v1.3.sh
    ```
 
-4. Enter your `sudo` password when prompted
+4. Enter your `sudo` password when asked
 5. Start HITMAN however you normally do, including straight into VR
 6. Play
 
-Leave the terminal open while you play. Press `Ctrl+C` to stop the fix and restore any live changes.
+Leave the terminal open while you play.
 
-On Linux, the same states are reported in the terminal.
+Press `Ctrl+C` to stop the fix and restore any live changes.
 
-> Linux/Proton/SteamVR: v1.3 replaces the timing-sensitive v1.2 reload logic and has been visually verified in the headset across new missions, mission restarts, and save-game loads. The Linux port uses the same v1.3 patches and renderer values, with Linux process-memory access in place of the Windows APIs. A Linux-specific 1 ms guard monitors the renderer scale and mask values because Proton can restore them during save-game loads faster than the normal 15 ms lifecycle loop can catch. The guard uses the same validated render-value routine as the main loop, shares the same synchronization and rollback handling, and feeds its writes into the existing v1.3 reload lifecycle.
+The Linux version reports the same states in the terminal.
 
-The Linux launcher serves the same purpose: it changes to the folder containing the script and starts `Linux-HitmanVRFoveationFix-v1.3.py` with the privileges required to access HITMAN's process memory.
+> Linux/Proton/SteamVR: v1.3 replaces the timing-sensitive v1.2 reload logic and has been visually tested in the headset across new missions, mission restarts and save-game loads. It uses the same v1.3 patches and renderer values as the Windows version, with Linux process-memory access replacing the Windows APIs.
+>
+> Proton can restore the renderer scale and mask values during a save-game load faster than the normal 15 ms lifecycle loop can catch them, so the Linux port also runs a 1 ms guard. That guard uses the same validated render-value routine, synchronization and rollback handling as the main loop, and any writes still go through the existing v1.3 reload lifecycle.
+
+The launcher itself is deliberately boring. It changes to the script's folder and starts `Linux-HitmanVRFoveationFix-v1.3.py` with the privileges needed to access HITMAN's process memory.
 
 ---
 
 ## What it actually does
 
-HITMAN renders VR with **fixed foveation**: four layers per frame instead of two.
+HITMAN renders VR using **fixed foveation**.
 
-- Two **wide** layers at half resolution, covering the whole field of view
-- Two **narrow** layers at full resolution, covering only a small circle in the centre
+Instead of rendering one full-resolution image for each eye, it renders four layers per frame:
 
-Everything outside that circle is upscaled from the half-resolution layer. On a
-headset sharp enough to show the difference, the result is a small sharp island in a
-sea of mush — and because the circle is fixed to the centre of the image and not to
-where you are looking, you spend most of your time looking at the blurry part.
+- two **wide** layers at half resolution, covering the whole field of view
+- two **narrow** layers at full resolution, covering only a small circle in the centre
 
-This tool switches the game to **two layers at full resolution**, covering the whole
-field of view. There is no wide/narrow split left at all.
+Outside that circle, the image comes from the half-resolution layer and gets scaled up.
 
-It costs **twice the pixel work**: before, four slices at 936 x 1008 each; after,
-two at 1872 x 2016. Same total field of view, twice the pixels. In testing the frame
-rate held up because the game is not GPU-bound at these resolutions, but that is a
-happy accident, not a free lunch.
+On a headset sharp enough to show it, the result is basically a small sharp island surrounded by blur.
 
-The number that does hold up is the pixel density:
+And the sharp circle does not follow your eyes. It stays fixed in the middle of the image.
+
+Move your eyes away from the centre and you are looking at the blurry part.
+
+This tool changes that to **two full-resolution layers covering the entire field of view**.
+
+The wide/narrow split is gone.
+
+There is one complication.
+
+HITMAN still expects four logical views for geometry and visibility. v1.4 keeps that four-view behaviour, as v1.3 did, but limits the refraction-depth copy to the two physical eye views.
+
+That stops the narrow foveal views leaking into transparent materials without bringing back the geometry pop-in.
+
+### What does it cost?
+
+About **twice the pixel work**.
+
+Before:
+
+- four slices at 936 × 1008
+
+After:
+
+- two slices at 1872 × 2016
+
+The field of view is the same. The renderer is pushing roughly twice as many pixels.
+
+In my testing the frame rate held up because the game was not GPU-bound at these resolutions.
+
+That does **not** mean the extra pixels are free. It just means my test setup had enough GPU headroom to get away with it.
+
+The useful comparison is pixel density:
 
 | | pixels | across | density |
 |---|---|---|---|
 | old sweet spot | 936 | ~49° | 19.1 px/° |
 | now, everywhere | 1872 | 99° | 18.9 px/° |
 
-About one percent apart. You get the old sweet-spot density — you just get it across
-the whole view instead of a small circle in the middle.
+That is about one percent apart.
+
+So the old sharp centre already had basically the right pixel density. The problem was that HITMAN only gave it to a small circle in front of you.
+
+Now you get roughly that density across the whole view.
 
 No resolution setting is changed. You do not need to raise anything.
 
 ---
 
-## Is it safe
+## Is it safe?
 
-- **No game file or setting is modified.** Renderer changes are made in the memory
-  of the running process and disappear when you close HITMAN. The tool keeps a small
-  `foveationfix.log` beside the script so timing problems can be diagnosed; it contains
-  timestamps and renderer state changes and can be deleted at any time.
-- It refuses to do anything if the game code is not in its original state, if VR is
-  already running when it attaches, or if the VR device does not look the way it
-  expects.
-- Turning it off or closing the window restores the bytes owned by that tool
-  instance when they are still safe to touch. Closing HITMAN itself always discards
-  every in-memory change.
+There are two different questions hiding in that word.
 
-**Said plainly:** it does write to the memory of a game that has an online connection.
-That has been fine in testing, but you should know it before you decide. There is no
-way to change what the renderer does without touching the renderer.
+### Does it modify the game permanently?
 
-Verified on build **3.270.1**. On other builds the tool locates the relevant code by
-byte pattern and tells you the build is untested — and if anything is ambiguous, it
-refuses instead of guessing.
+No.
+
+- **No game file or setting is modified.**
+- Renderer changes are made only in the memory of the running HITMAN process.
+- Close HITMAN and the operating system throws that process memory away.
+- The tool writes a small `foveationfix.log` next to the script containing timestamps and renderer state changes. You can delete it whenever you like.
+
+The tool also refuses to continue if:
+
+- the game code is not in the state it expects
+- VR is already running when it attaches
+- the VR device does not look the way it expects
+
+When you stop the tool, it restores the bytes owned by that instance when they are still safe to touch.
+
+v1.4 briefly pauses HITMAN's threads, checks that none of them is currently inside a replaced call block or wrapper, restores the outer refraction hook first, then restores the remaining owned bytes.
+
+Closing HITMAN itself always removes every in-memory change anyway.
+
+### Is there zero risk?
+
+No, and I am not going to pretend there is.
+
+**This tool writes to the memory of a game that has an online connection.**
+
+That has been fine in testing. You should still know it before deciding whether you want to run it.
+
+There is no magic renderer checkbox hidden in an `.ini` file here. Changing what this renderer does means changing the renderer while the game is running.
+
+The fix was verified on build **3.270.1**.
+
+On other builds, the tool searches for both the v1.3 base sites and all three v1.4 refraction call blocks using strong byte patterns.
+
+Both inner calls must resolve to the same `CopyRefractionDepth` target.
+
+If something is missing, ambiguous or inconsistent, the tool stops.
+
+It does not guess.
 
 ---
 
 ## To IO Interactive
 
-If anyone at IOI reads this: you are welcome to take this. No permission needed, no
-credit needed, no strings. The whole change is five instructions and three values,
-all documented in [`docs/HOW-IT-WORKS.md`](docs/HOW-IT-WORKS.md).
+If anyone at IOI reads this: please take it.
 
-Two full-resolution layers instead of four half-resolution ones costs twice the
-pixel work and looks dramatically better on modern headsets — and on hardware that
-is not GPU-bound, which is most of it, that cost does not show. It would be a lovely
-patch note.
+No permission needed. No credit needed. No strings attached.
+
+The original sharpness fix is five instructions and three values.
+
+v1.4 adds two things:
+
+- `CopyRefractionDepth` is limited to the physical eye count
+- the two renderer values which can be restored during loading are continuously watched and repaired
+
+The details are in [`docs/HOW-IT-WORKS.md`](docs/HOW-IT-WORKS.md).
+
+Two full-resolution layers instead of four half-resolution ones means roughly twice the pixel work, but it also looks dramatically better on modern headsets.
+
+On the hardware I tested, there was enough GPU headroom that the extra work did not hurt the frame rate.
+
+It would make a very nice patch note.
 
 ---
 
 ## Reporting a problem
 
-If the tool does not go green, or something looks wrong, please
-[open an issue](https://github.com/RealChrizzl/hitman-vr-foveation-fix/issues) — and
-include **the exact wording the window showed you**. Grey, amber and red all say
-something different, and the message alone usually identifies the cause.
+If the tool does not turn green, or something looks wrong, please
+[open an issue](https://github.com/RealChrizzl/hitman-vr-foveation-fix/issues).
 
-For anything beyond that there is a read-only diagnostic in
-[`tools/`](tools/). Put `HitmanVRProbe.ps1` and `HitmanVRProbe.bat` in the same
-folder, start the game, get into VR and into a mission, double-click the `.bat` and
-press **Copy report**. Probe v1.1 also reports whether every live code site is
-stock, fixed, or unexpected; a foveation value of zero is now displayed correctly.
+Include **the exact wording shown in the window**.
 
-It imports only `OpenProcess`, `ReadProcessMemory` and `CloseHandle` — no write
-function is declared at all, so it cannot modify the game even in principle.
+Grey, amber and red mean different things, and the message usually tells me where things went wrong.
+
+If that is not enough, there is a read-only diagnostic tool in [`tools/`](tools/).
+
+Put `HitmanVRProbe.ps1` and `HitmanVRProbe.bat` in the same folder, start HITMAN, enter VR and load into a mission. Then double-click the `.bat` and press **Copy report**.
+
+Probe v1.1 also reports whether every live v1.3 base-code site is:
+
+- stock
+- fixed
+- unexpected
+
+A foveation value of zero is displayed correctly.
+
+The v1.4 refraction wrappers also monitor their own owner/count telemetry in the main tool and write a compact summary to `foveationfix.log`.
+
+The probe imports only:
+
+- `OpenProcess`
+- `ReadProcessMemory`
+- `CloseHandle`
+
+There is no write function in it at all.
+
+So the probe cannot modify the game even in principle.
 
 ---
 
 ## For the curious
 
-- [`docs/HOW-IT-WORKS.md`](docs/HOW-IT-WORKS.md) — how the foveation works, what the
-  fix changes, and how it was found
-- [`docs/UPDATING.md`](docs/UPDATING.md) — how to re-find everything if a future game
-  update breaks the pattern search
+- [`docs/HOW-IT-WORKS.md`](docs/HOW-IT-WORKS.md) — how HITMAN's foveation works, what the fix changes and how I found it
+- [`docs/UPDATING.md`](docs/UPDATING.md) — how to find everything again if a future game update breaks the pattern search
 
-You do not need either of these to use the tool.
+You do not need either document to use the tool.
+
+They are there for people who see "process memory patching" and immediately want to know exactly which bytes are getting bullied.
 
 ---
 
@@ -195,10 +309,11 @@ You do not need either of these to use the tool.
 
 Made by **RealChrizzl**.
 
-This is the result of roughly twenty hours of reverse engineering, and it would not
-exist without the AI assistants that did the heavy lifting on the disassembly:
-**Claude Opus 5** and **Sol 5.6**. I ran the tests, wore the headset and made the
-calls about what looked right — that part is not something a model can do for you.
+This took roughly twenty hours of reverse engineering.
+
+A large part of the disassembly work was done with **Claude Opus 5** and **Sol 5.6**. I ran the tests, wore the headset and made the calls about what actually looked right.
+
+A model cannot put on a Quest 3 and tell me whether the glass is broken in the left eye.
 
 To be bloody honest: without AI I would not be here sharing software.
 
@@ -206,5 +321,10 @@ To be bloody honest: without AI I would not be here sharing software.
 
 ## Licence
 
-MIT — see [`LICENSE`](LICENSE). Do what you like with it, including forking it if I
-ever stop maintaining it. That is rather the point.
+MIT — see [`LICENSE`](LICENSE).
+
+Do what you like with it.
+
+Fork it if I disappear one day.
+
+That is rather the point.
