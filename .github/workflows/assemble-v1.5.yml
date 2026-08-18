@@ -1,0 +1,39 @@
+name: Assemble v1.5 staging
+
+on:
+  push:
+    branches:
+      - agent/release-v1.5
+    paths:
+      - '.release-staging/**'
+      - '.github/workflows/assemble-v1.5.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/release-v1.5
+          fetch-depth: 0
+
+      - name: Assemble and verify Windows script
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .release-staging/HitmanVRFoveationFix.ps1.part* > HitmanVRFoveationFix.ps1
+          printf '%s  %s\n' '02eca202a17074c275c02e0dd6a852b75a52fdef96595e74cb39e201adee9c25' 'HitmanVRFoveationFix.ps1' | sha256sum --check --strict
+
+      - name: Commit assembled source and remove staging files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add HitmanVRFoveationFix.ps1
+          git rm -r .release-staging .github/workflows/assemble-v1.5.yml
+          git commit -m 'Assemble v1.5 Windows release [skip ci]'
+          git push origin HEAD:agent/release-v1.5
