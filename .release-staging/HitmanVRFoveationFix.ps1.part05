@@ -1,0 +1,317 @@
+        $at=$hits[0]
+        $rel=[BitConverter]::ToInt32($peCheck.Text,$at+$SIG_DEVICE_REL)
+        $slot=[int64]($peCheck.TextRVA+$at+7+$rel)
+        $wno=[int64][BitConverter]::ToUInt32($peCheck.Text,$at+$SIG_DEVICE_DSP)
+        if ($wno -le 0 -or $wno -gt 0x4000) {
+            $script:fatal="Implausible device layout in this build. Nothing was changed."
+            return $false }
+    }
+
+    $hnd=[HmFix]::OpenProcess(0x1F0FFF,$false,$p.Id)
+    if ($hnd -eq [IntPtr]::Zero) {
+        try { if ($p.HasExited) { return $false } } catch { return $false }
+        $script:fatal="Access denied. Close this tool and start it as administrator."
+        return $false }
+
+    if ($MODE_INFO.UsesHook) {
+        [UInt32]$shadowPolicy=0
+        if (-not [HmFix]::GetProcessMitigationPolicy($hnd,15,[ref]$shadowPolicy,[UIntPtr]::op_Explicit(4))) {
+            [HmFix]::CloseHandle($hnd) | Out-Null
+            $script:fatal="Windows' hardware shadow-stack state could not be verified. The v1.4 hook was not installed."
+            return $false }
+        if (($shadowPolicy -band 1) -ne 0) {
+            [HmFix]::CloseHandle($hnd) | Out-Null
+            $script:fatal="Hardware-enforced stack protection is active for HITMAN. This v1.4 hook is conservatively refused."
+            return $false } }
+
+    $script:handle=$hnd; $script:gamePid=$p.Id; $script:process=$p; $script:base=$b
+    $script:mode=$mode; $script:sites=$sites; $script:guardSites=$guards; $script:hookDescriptors=$hooks
+    $script:devSlot=$slot; $script:wnoOff=$wno
+    Log ("attached pid {0}, build {1}, mode {2}, base sites {3}, guards {4}, v1.4 calls {5}" -f $p.Id,$stamp,$mode,$sites.Count,$guards.Count,$hooks.Count)
+    Log ("writes: " + ((@($sites | ForEach-Object { "{0}=0x{1:X}" -f $(if($_.Name){$_.Name}else{"site"}),$_.RVA })) -join ", "))
+    Log ("guards: " + ((@($guards | ForEach-Object { "{0}=0x{1:X}" -f $(if($_.Name){$_.Name}else{"site"}),$_.RVA })) -join ", "))
+    return $true }
+
+# --- device access, mode aware ---------------------------------------------
+function Dev-Plausible { param([Int64]$d)
+    if ($d -lt 0x10000 -or $d -gt 0x7FFFFFFFFFFF) { return $false }
+    try {
+        $fb = RB $script:handle ($d+$OFF_FOV) 16
+        for ($i=0;$i -lt 4;$i++) {
+            $f=[BitConverter]::ToSingle($fb,$i*4)
+            if ($f -lt 0.2 -or $f -gt 3.0) { return $false } }
+        $a = U8 $script:handle ($d+$OFF_ACTIVE)
+        if ($a -gt 1) { return $false }
+    } catch { return $false }
+    return $true }
+
+# returns 0 = no device yet, -1 = wrong backend, otherwise the device address
+function Get-Dev {
+    if ($script:mode -eq "verified") {
+        $mgr=$script:base+$MANAGER_RVA
+        if ((I64 $script:handle $mgr) -ne ($script:base+$MANAGER_VTABLE_RVA)) { return 0L }
+        $d=I64 $script:handle ($mgr+$MANAGER_DEVICE_OFFSET)
+        if ($d -eq 0) { return 0L }
+        $vt = I64 $script:handle $d
+        if ($vt -ne ($script:base+$OCULUS_VTABLE_RVA) -and
+            $vt -ne ($script:base+$OPENVR_VTABLE_RVA)) { return -1L }
+        return $d
+    }
+    try { $d = I64 $script:handle ($script:base+$script:devSlot) } catch { return 0L }
+    if (-not (Dev-Plausible $d)) { return 0L }
+    return $d }
+
+# 0 = safely not running, 1 = running, -1 = state could not be proven.
+function Get-VRStartState {
+    try { $d = Get-Dev } catch { return -1 }
+    if ($d -eq -1L) { return -1 }
+    if ($d -eq 0L) { return 0 }
+    try {
+        $active=U8 $script:handle ($d+$OFF_ACTIVE)
+        if ($active -eq 0) { return 0 }
+        if ($active -eq 1) { return 1 }
+        return -1
+    } catch { return -1 } }
+
+# Either backend is fine - the device layout is identical, verified on both.
+function VR-Runtime-Loaded {
+    try {
+        # Process.Modules is cached by System.Diagnostics.Process. Refresh is
+        # required or a runtime loaded after the first check is never observed.
+        $script:process.Refresh()
+        foreach ($m in $script:process.Modules) {
+            if ($m.ModuleName -like "LibOVRRT*" -or $m.ModuleName -like "openvr_api*") { return $true } } } catch {}
+    return $false }
+
+# Read and neutralise the device values as soon as its geometry block is valid.
+# In particular this runs before +0x319 becomes active.  OpenVR rebuilds the
+# shader/constant-buffer state during mission and save-game loads; changing these
+# fields only after that rebuild leaves the old centre mask cached on the GPU.
+function Sync-RenderValuesCore { param([Int64]$d)
+    $result=[pscustomobject]@{ Initialized=$false; Fixed=$false; Wrote=$false; Error="" }
+
+    $fb=RB $script:handle ($d+$OFF_FOV) 16
+    for ($i=0;$i -lt 4;$i++) {
+        $f=[BitConverter]::ToSingle($fb,$i*4)
+        if ([Single]::IsNaN($f) -or [Single]::IsInfinity($f) -or $f -lt 0.2 -or $f -gt 3.0) {
+            return $result } }
+
+    $sb=RB $script:handle ($d+$OFF_SCALE) 16
+    for ($i=0;$i -lt 4;$i++) {
+        $f=[BitConverter]::ToSingle($sb,$i*4)
+        # All-zero scale fields mean the device builder has not reached this
+        # block yet.  Do not capture or overwrite partially constructed data.
+        if ([Single]::IsNaN($f) -or [Single]::IsInfinity($f) -or $f -lt 0.05 -or $f -gt 20.0) {
+            return $result } }
+
+    $mb=RB $script:handle ($d+$OFF_MASK) 8
+    for ($i=0;$i -lt 2;$i++) {
+        $f=[BitConverter]::ToSingle($mb,$i*4)
+        if ([Single]::IsNaN($f) -or [Single]::IsInfinity($f) -or $f -lt -0.01 -or $f -gt 4.0) {
+            return $result } }
+
+    $result.Initialized=$true
+    $scaleFixBytes=W2B $SCALE_FIX
+    $sOk=Same $sb $scaleFixBytes
+    $mOk=Same $mb $MASK_FIX
+
+    if (-not $sOk) {
+        $wasTouched=$script:scaleTouched
+        if (-not $wasTouched) { $script:scaleStock=$sb }
+        # Claim ownership before the call. WriteProcessMemory may modify a prefix
+        # (or even all bytes) and still report failure/a short write.
+        $script:scaleTouched=$true; $result.Wrote=$true
+        try { WB $script:handle ($d+$OFF_SCALE) $scaleFixBytes } catch {}
+        try { $after=RB $script:handle ($d+$OFF_SCALE) 16 }
+        catch {
+            $script:deviceRestoreUncertain=$true
+            $result.Error="Scale write could not be verified. Close HITMAN if this repeats."
+            return $result }
+        if (-not (Same $after $scaleFixBytes)) {
+            $rolledBack=Same $after $sb
+            if (-not $rolledBack) {
+                try {
+                    WB $script:handle ($d+$OFF_SCALE) $sb
+                    $rolledBack=Same (RB $script:handle ($d+$OFF_SCALE) 16) $sb }
+                catch { $rolledBack=$false } }
+            if ($rolledBack -and -not $wasTouched) {
+                $script:scaleTouched=$false; $script:scaleStock=$null }
+            if (-not $rolledBack) { $script:deviceRestoreUncertain=$true }
+            $result.Error=if($rolledBack){"Scale write failed and was rolled back; retrying."}else{"Scale write left an unknown value. Close HITMAN."}
+            return $result } }
+    if (-not $mOk) {
+        $wasTouched=$script:maskTouched
+        if (-not $wasTouched) { $script:maskStock=$mb }
+        $script:maskTouched=$true; $result.Wrote=$true
+        try { WB $script:handle ($d+$OFF_MASK) $MASK_FIX } catch {}
+        try { $after=RB $script:handle ($d+$OFF_MASK) 8 }
+        catch {
+            $script:deviceRestoreUncertain=$true
+            $result.Error="Mask write could not be verified. Close HITMAN if this repeats."
+            return $result }
+        if (-not (Same $after $MASK_FIX)) {
+            $rolledBack=Same $after $mb
+            if (-not $rolledBack) {
+                try {
+                    WB $script:handle ($d+$OFF_MASK) $mb
+                    $rolledBack=Same (RB $script:handle ($d+$OFF_MASK) 8) $mb }
+                catch { $rolledBack=$false } }
+            if ($rolledBack -and -not $wasTouched) {
+                $script:maskTouched=$false; $script:maskStock=$null }
+            if (-not $rolledBack) { $script:deviceRestoreUncertain=$true }
+            $result.Error=if($rolledBack){"Mask write failed and was rolled back; retrying."}else{"Mask write left an unknown value. Close HITMAN."}
+            return $result } }
+
+    # A failed or immediately overwritten value must not result in a green
+    # status.  A later tick retries it during the same loading transition.
+    try {
+        $result.Fixed = (Same (RB $script:handle ($d+$OFF_SCALE) 16) $scaleFixBytes) -and
+                        (Same (RB $script:handle ($d+$OFF_MASK) 8) $MASK_FIX) }
+    catch {
+        # Preserve Wrote=true so a write made after transition 3 still latches
+        # the required reload even when this final verification read is lost.
+        $result.Error="Render values were written but the final verification read failed; retrying."
+        return $result }
+    return $result }
+
+function Sync-RenderValues { param([Int64]$d)
+    [Threading.Monitor]::Enter($script:renderSyncGate)
+    try {
+        # The guard raises its fault while holding this same lock, so anyone who
+        # acquires it afterwards is guaranteed to see it. That is what makes the
+        # unknown-state case genuinely fail closed rather than usually closed.
+        $g=$script:rendererGuard
+        if ($null -ne $g) {
+            $faulted=$false
+            try { $faulted=$g.HasFault } catch {}
+            if ($faulted) {
+                return [pscustomobject]@{ Initialized=$false; Fixed=$false; Wrote=$false
+                    Error="A renderer value was left in an unknown state after a partial write. Close HITMAN." } } }
+        return (Sync-RenderValuesCore $d)
+    } finally { [Threading.Monitor]::Exit($script:renderSyncGate) }
+}
+
+function Prepare-HookCave {
+    if (-not $MODE_INFO.UsesHook) { return $true }
+    if ($script:hookPrepared) { return $true }
+    try {
+        $cave=Allocate-HookMemory
+        if ($cave -eq 0) { throw "the private v1.4 wrapper allocation failed" }
+        $dynamic=@()
+        foreach ($call in $script:hookDescriptors) {
+            if ([Int64]$call.ContinuationRVA -ne ([Int64]$call.RVA+[Int64]$call.Stock.Length)) {
+                throw ("{0} call block does not end at its verified continuation" -f $call.Kind) }
+            if($call.Kind -ne "Mesh") {
+                $originalCallOffset=if($call.Kind -eq "Outer"){13}else{16}
+                if ($call.Stock[$originalCallOffset] -ne 0xE8) { throw ("{0} original call opcode is missing" -f $call.Kind) }
+                $originalRel=[BitConverter]::ToInt32($call.Stock,$originalCallOffset+1)
+                $decodedTarget=[Int64]$call.RVA+$originalCallOffset+5L+$originalRel
+                if ($decodedTarget -ne [Int64]$call.TargetRVA) {
+                    throw ("{0} target RVA does not match the original direct call" -f $call.Kind) }
+            }
+            $unitAddress=$cave+[Int64]$call.UnitOffset
+            if($call.Kind -eq "Outer"){$wrapper=Build-OuterUnit $unitAddress ($script:base+[Int64]$call.TargetRVA) ([bool]$MODE_INFO.OuterChangesCount)}
+            elseif($call.Kind -eq "Mesh"){$wrapper=Build-MeshUnit $unitAddress}
+            else{$wrapper=Build-CopyUnit $call $unitAddress ($script:base+[Int64]$call.TargetRVA) ([int]$MODE_INFO.CopyFrom) ([int]$MODE_INFO.CopyTo)}
+            $expectedWrapperLength=
+                if($call.Kind -eq "Outer"){if([bool]$MODE_INFO.OuterChangesCount){498}else{474}}
+                elseif($call.Kind -eq "Mesh"){98}
+                else{311}
+            if ($wrapper.Length -ne $expectedWrapperLength -or ([Int64]$call.UnitOffset+$wrapper.Length) -gt 0x1000L) {
+                throw ("{0} wrapper shape changed unexpectedly" -f $call.Kind) }
+            WB $script:handle $unitAddress $wrapper
+            $fix=Build-CallPatch $call $cave
+            if ([BitConverter]::ToUInt64($fix,8) -ne [UInt64]$unitAddress) {
+                throw ("{0} call block does not point at its wrapper" -f $call.Kind) }
+            $dynamic += [pscustomobject]@{
+                Name=$call.Name; Kind=$call.Kind; RVA=[Int64]$call.RVA
+                Stock=[byte[]]$call.Stock; Fix=[byte[]]$fix
+                WrapperAddress=$unitAddress; Wrapper=[byte[]]$wrapper }
+        }
+        if ($dynamic.Count -ne $MODE_INFO.HookKinds.Count) { throw "not every selected pass wrapper was built" }
+        $magic=[Text.Encoding]::ASCII.GetBytes("HMFIX-V1.4-W")
+        WB $script:handle ($cave+0x1400L) $magic
+        [UInt32]$oldProtect=0
+        if (-not [HmFix]::VirtualProtectEx($script:handle,[IntPtr]$cave,[UIntPtr]::op_Explicit(0x1000),0x20,[ref]$oldProtect)) {
+            throw "could not make the verified hook page executable" }
+        if (-not [HmFix]::FlushInstructionCache($script:handle,[IntPtr]$cave,[UIntPtr]::op_Explicit(0x1000))) {
+            throw "could not flush the verified hook page" }
+        foreach ($site in $dynamic) {
+            if (-not (Same (RB $script:handle $site.WrapperAddress $site.Wrapper.Length) $site.Wrapper)) { throw "wrapper readback failed" }
+            if ($site.Fix.Length -ne $site.Stock.Length) { throw "invalid dynamic call-block length" } }
+        if (-not (Same (RB $script:handle ($cave+0x1400L) $magic.Length) $magic)) { throw "hook ownership marker readback failed" }
+        $script:hookCave=$cave; $script:hookSites=$dynamic; $script:hookPrepared=$true
+        Log ("v1.4 refraction cave prepared at 0x{0:X}; calls {1}" -f $cave,(($dynamic | ForEach-Object {$_.Kind}) -join ","))
+        return $true
+    } catch {
+        $script:fatal=("The v1.4 refraction hook could not be prepared safely: {0}. Nothing was hooked." -f $_.Exception.Message)
+        return $false }
+}
+
+function Read-HookTelemetry { param($Site)
+    if (-not $script:hookPrepared -or $script:hookCave -eq 0) { return $null }
+    $bytes=RB $script:handle ($script:hookCave+0x1000L) 0xA0
+    return [pscustomobject]@{
+        Kind=$Site.Kind
+        Calls=[BitConverter]::ToUInt64($bytes,0x00)
+        Changed=[BitConverter]::ToUInt64($bytes,0x08)
+        Restored=[BitConverter]::ToUInt64($bytes,0x10)
+        BadCount=[BitConverter]::ToUInt64($bytes,0x18)
+        LastOld=[BitConverter]::ToUInt32($bytes,0x20)
+        MaxTop=[BitConverter]::ToUInt32($bytes,0x24)
+        BadState=[BitConverter]::ToUInt64($bytes,0x28)
+        Active=[BitConverter]::ToUInt64($bytes,0x30)
+        OwnerTid=[BitConverter]::ToUInt64($bytes,0x38)
+        OwnerCtx=[BitConverter]::ToUInt64($bytes,0x40)
+        OwnerAcquired=[BitConverter]::ToUInt64($bytes,0x48)
+        OwnerReleased=[BitConverter]::ToUInt64($bytes,0x50)
+        MeshOverrides=[BitConverter]::ToUInt64($bytes,0x58)
+        CopyACalls=[BitConverter]::ToUInt64($bytes,0x60)
+        CopyAChanged=[BitConverter]::ToUInt64($bytes,0x68)
+        CopyARestored=[BitConverter]::ToUInt64($bytes,0x70)
+        CopyAActive=[BitConverter]::ToUInt64($bytes,0x78)
+        CopyBCalls=[BitConverter]::ToUInt64($bytes,0x80)
+        CopyBChanged=[BitConverter]::ToUInt64($bytes,0x88)
+        CopyBRestored=[BitConverter]::ToUInt64($bytes,0x90)
+        CopyBActive=[BitConverter]::ToUInt64($bytes,0x98) }
+}
+
+function Read-AllHookTelemetry {
+    if (-not $script:hookPrepared -or $script:hookCave -eq 0) { return $null }
+    $bytes=RB $script:handle ($script:hookCave+0x1000L) 0xA0
+    return [pscustomobject]@{
+        Calls=[BitConverter]::ToUInt64($bytes,0x00); Changed=[BitConverter]::ToUInt64($bytes,0x08)
+        Restored=[BitConverter]::ToUInt64($bytes,0x10); BadCount=[BitConverter]::ToUInt64($bytes,0x18)
+        LastOld=[BitConverter]::ToUInt32($bytes,0x20); MaxTop=[BitConverter]::ToUInt32($bytes,0x24)
+        BadState=[BitConverter]::ToUInt64($bytes,0x28); Active=[BitConverter]::ToUInt64($bytes,0x30)
+        OwnerTid=[BitConverter]::ToUInt64($bytes,0x38); OwnerCtx=[BitConverter]::ToUInt64($bytes,0x40)
+        OwnerAcquired=[BitConverter]::ToUInt64($bytes,0x48); OwnerReleased=[BitConverter]::ToUInt64($bytes,0x50)
+        MeshOverrides=[BitConverter]::ToUInt64($bytes,0x58)
+        CopyACalls=[BitConverter]::ToUInt64($bytes,0x60); CopyAChanged=[BitConverter]::ToUInt64($bytes,0x68)
+        CopyARestored=[BitConverter]::ToUInt64($bytes,0x70); CopyAActive=[BitConverter]::ToUInt64($bytes,0x78)
+        CopyBCalls=[BitConverter]::ToUInt64($bytes,0x80); CopyBChanged=[BitConverter]::ToUInt64($bytes,0x88)
+        CopyBRestored=[BitConverter]::ToUInt64($bytes,0x90); CopyBActive=[BitConverter]::ToUInt64($bytes,0x98) }
+}
+
+function Get-HookTelemetryState {
+    $result=[pscustomobject]@{ Ready=(-not $MODE_INFO.UsesHook); Error=""; Summary="" }
+    if (-not $MODE_INFO.UsesHook) { return $result }
+    $parts=@(); $allReady=$true; $now=Get-Date
+    try {
+        $checkIntegrity=(($now-$script:lastHookIntegrityCheck).TotalSeconds -ge 2)
+        foreach ($site in $script:hookSites) {
+            if ($checkIntegrity) {
+                if (-not (Same (RB $script:handle ($script:base+$site.RVA) $site.Fix.Length) $site.Fix)) {
+                    throw ("{0} call block no longer matches the installed v1.4 fix" -f $site.Kind) }
+                if (-not (Same (RB $script:handle $site.WrapperAddress $site.Wrapper.Length) $site.Wrapper)) {
+                    throw ("{0} wrapper code no longer matches its verified image" -f $site.Kind) } }
+        }
+        $t=Read-AllHookTelemetry
+        if ($null -eq $t) { throw "hook telemetry is unavailable" }
+        if ($t.BadCount -ne 0 -or $t.BadState -ne 0 -or $t.MaxTop -gt 4) {
+            throw ("a wrapper rejected an unexpected owner/count state (badCount={0}, badState={1}, maxTop={2})" -f $t.BadCount,$t.BadState,$t.MaxTop) }
+        $stableSample=$null
+        if ($t.Active -eq 0 -and $t.CopyAActive -eq 0 -and $t.CopyBActive -eq 0) {
+            $second=Read-AllHookTelemetry
+            if($null -ne $second -and $second.Active -eq 0 -and $second.CopyAActive -eq 0 -and $second.CopyBActive -eq 0 -and
+               $second.Calls -eq $t.Calls -and $second.Changed -eq $t.Changed -and $second.Restored -eq $t.Restored -and
