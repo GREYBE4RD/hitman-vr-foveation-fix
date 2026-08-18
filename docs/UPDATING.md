@@ -16,9 +16,9 @@ this repository.
 
 ---
 
-## The five patterns
+## Base signatures
 
-Four are patched, one is only used to locate the VR device. `??` matches any byte.
+Six signatures identify patched base sites; one additional signature is used only to locate the VR device. `??` matches any byte.
 The **hit offset** is how far into the match the patched instruction begins.
 
 ### 1. WNO writer A — hit offset 9
@@ -77,6 +77,19 @@ view; the unused one never executes.
 Patch the `cmpb` to `48 85 E4 90 90 90 90` = `test rsp,rsp` + four `nop`. That clears
 the zero flag without touching a register, so the following `cmovne` always fires and
 the count is 4.
+
+### 4b. View count, second site — hit offset 9
+
+```
+49 8B 8D A0 41 01 00 74 1A 80 B9 1B 03 00 00 00 BF 02 00 00
+```
+
+The same 1/2/4 count, set up a second time about 3.6 KB further on. Same patch. Note
+the shared `A0 41 01 00` in both view-count patterns — that is the `+0x141A0` device
+offset in the render manager, and it is the most stable part of either signature.
+
+Patch one and not the other and the geometry is fine but one eye keeps a black oval
+mask at the edge of its field of view. Both must be applied.
 
 ### 5. Device locator — not patched
 

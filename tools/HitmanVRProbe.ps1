@@ -77,6 +77,7 @@ $SIGS = [ordered]@{
   "field of view A"  = @{ Pattern="C0 08 00 00 45 33 C0 4C 8B 8E C8 7A 00 00 48 8B D3 48 89 6C 24 28 48 89 6C 24 20 48 8B 01 FF 50 28 48 8B CB E8 ?? ?? ?? ?? FF 4B 14 0F B6 87 1B 03 00 00"; Hit=44; Stock=[byte[]](0x0F,0xB6,0x87,0x1B,0x03,0x00,0x00); Fix=[byte[]](0xB8,0x01,0x00,0x00,0x00,0x90,0x90) }
   "field of view B"  = @{ Pattern="50 09 00 00 45 33 C0 4C 8B 8E C8 7A 00 00 48 8B D3 48 89 6C 24 28 48 89 6C 24 20 48 8B 01 FF 50 28 48 8B CB E8 ?? ?? ?? ?? FF 4B 14 0F B6 87 1B 03 00 00"; Hit=44; Stock=[byte[]](0x0F,0xB6,0x87,0x1B,0x03,0x00,0x00); Fix=[byte[]](0xB8,0x01,0x00,0x00,0x00,0x90,0x90) }
   "view count"       = @{ Pattern="74 16 49 8B 85 A0 41 01 00 41 8B CF 80 B8 1B 03 00 00 00 0F 45 CF"; Hit=12; Stock=[byte[]](0x80,0xB8,0x1B,0x03,0x00,0x00,0x00); Fix=[byte[]](0x48,0x85,0xE4,0x90,0x90,0x90,0x90) }
+  "view count B"     = @{ Pattern="49 8B 8D A0 41 01 00 74 1A 80 B9 1B 03 00 00 00 BF 02 00 00"; Hit=9; Stock=[byte[]](0x80,0xB9,0x1B,0x03,0x00,0x00,0x00); Fix=[byte[]](0x48,0x85,0xE4,0x90,0x90,0x90,0x90) }
   "device locator"   = @{ Pattern="48 8B 0D ?? ?? ?? ?? 8B D6 48 8B 01 44 38 B9 1B 03 00 00 0F 84"; Hit=0 }
 }
 

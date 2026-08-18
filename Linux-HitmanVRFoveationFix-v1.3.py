@@ -1510,7 +1510,7 @@ def main() -> int:
     signal.signal(signal.SIGINT, fix.stop)
     signal.signal(signal.SIGTERM, fix.stop)
 
-    print("HitmanVRFoveationFix v1.3 - Linux/Proton itteration v1.3.3")
+    print("HitmanVRFoveationFix v1.3 - Linux/Proton iteration v1.3.3")
     print("Leave this terminal open while you play. Press Ctrl+C to turn off and restore.")
 
     rc = fix.run()
