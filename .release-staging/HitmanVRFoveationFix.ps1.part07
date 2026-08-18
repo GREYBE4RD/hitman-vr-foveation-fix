@@ -1,0 +1,276 @@
+                Resume-GameThreads $held | Out-Null; $held=@()
+                $script:fatal=("Live restoration failed ({0}) and was rolled back safely. Close HITMAN or try again." -f $failure)
+            }
+            return $false
+        }
+
+        $valuesOk=Restore-RendererValues
+        $resumeOk=Resume-GameThreads $held; $held=@()
+        if (-not $resumeOk) {
+            $script:fatal="The fix was restored, but one or more HITMAN threads could not be resumed. Close HITMAN."
+            return $false }
+
+        $script:patched=$false; $script:writtenSites=@()
+        if ($valuesOk) {
+            $script:scaleTouched=$false; $script:maskTouched=$false
+            $script:scaleStock=$null; $script:maskStock=$null
+            $script:deviceRestoreUncertain=$false
+            Log "restored"
+            return $true
+        }
+        $script:fatal="Code was restored, but a renderer value could not be restored safely. Closing HITMAN always discards it."
+        Log "restore incomplete - close HITMAN"
+        return $false
+    } finally {
+        if ($held.Count -gt 0 -and -not $script:unsafeCodeState) {
+            Resume-GameThreads $held | Out-Null }
+        [Threading.Monitor]::Exit($script:renderSyncGate)
+    }
+}
+
+# --- main loop -------------------------------------------------------------
+$timer=New-Object Windows.Forms.Timer
+$timer.Interval=15
+$timer.Add_Tick({
+    try {
+        if ($script:stopped) { return }
+
+        if ($script:handle -ne [IntPtr]::Zero) {
+            $gameClosed=(-not (Game-IsAlive))
+            if ($gameClosed) {
+                Log "game closed"; Detach; $script:fatal=""
+                Show-State "grey" "Waiting for HITMAN" "The game was closed. Start it again and v1.5 will apply automatically."
+                $btnStop.Enabled=$false; return } }
+
+        if ($script:suspendedHandles.Count -gt 0) {
+            if ($script:unsafeCodeState) {
+                Show-State "red" "End HITMAN in Task Manager" "A failed code rollback could not be verified. HITMAN is deliberately kept suspended so the uncertain instruction can never execute. Force-close the game process; do not resume it."
+                return }
+            if (Resume-GameThreads @()) { Log "previously suspended game threads were resumed on retry" }
+            else {
+                Show-State "red" "Close HITMAN" "One or more game threads could not be resumed after three retries. End HITMAN from Task Manager; no further write will be attempted."
+                return } }
+
+        if ($script:fatal) { Show-State "red" "Not active" $script:fatal; return }
+
+        if ($script:handle -eq [IntPtr]::Zero) {
+            if (-not (Try-Attach)) { if ($script:fatal) { Show-State "red" "Not active" $script:fatal }; return } }
+
+        $warn=""
+        if ($script:mode -eq "scanned") {
+            $warn="Untested build - every code pattern was unique, but please check the image carefully." }
+        $ready="v1.5 is patched. Put on your headset, start VR as usual, then load a mission."
+
+        if (-not $script:patched) {
+            if (-not (Apply-Code)) { return }
+            $btnStop.Enabled=$true
+            Show-State "amber" "Ready - start VR" $ready $warn
+            return }
+
+        $hookState=Get-HookTelemetryState
+        if ($hookState.Error) {
+            Stop-RendererGuard | Out-Null
+            $script:fatal=("The pass-local safety monitor detected an unexpected state: {0}. Close HITMAN now; do not continue this run." -f $hookState.Error)
+            Show-State "red" "Stop this run" $script:fatal $warn
+            return }
+
+        if ($script:guardError) {
+            Stop-RendererGuard | Out-Null
+            $script:fatal=("The continuous renderer guard stopped after a validated sync error: {0}" -f $script:guardError)
+            Show-State "red" "Renderer guard stopped" $script:fatal $warn
+            return }
+
+        $d = Get-Dev
+        if ($d -eq -1L) {
+            if ($script:dev -ne 0) { Reset-DeviceState $true }
+            Show-State "red" "Unsupported backend" "The active VR device is neither the Oculus nor the SteamVR one this tool was verified against."
+            return }
+        if ($d -eq 0L) {
+            if ($script:dev -ne 0) {
+                Log "VR device became unavailable"
+                Reset-DeviceState $true }
+            Show-State "amber" "Ready - start VR" $ready $warn; return }
+        if ($d -ne $script:dev) {
+            if ($script:dev -ne 0) { Reset-DeviceState $true } else { Reset-DeviceState }
+            $script:dev=$d
+            $backend="unknown"
+            try {
+                $vt=I64 $script:handle $d
+                if ($vt -eq ($script:base+$OCULUS_VTABLE_RVA)) { $backend="Oculus" }
+                elseif ($vt -eq ($script:base+$OPENVR_VTABLE_RVA)) { $backend="SteamVR/OpenVR" } }
+            catch {}
+            Log ("VR device found at 0x{0:X}, backend {1}" -f $d,$backend) }
+
+        $active=U8  $script:handle ($d+$OFF_ACTIVE)
+        $wno   =U8  $script:handle ($d+$script:wnoOff)
+        $trans =U32 $script:handle ($d+$OFF_TRANS)
+        $layers=U16 $script:handle ($d+$OFF_LAYERS)
+        $tex   =I64 $script:handle ($d+$OFF_TEX)
+        $w     =U32 $script:handle ($d+$OFF_W)
+        $h     =U32 $script:handle ($d+$OFF_H)
+
+        if ($script:mode -eq "scanned" -and -not $script:runtimeLoaded) {
+            $runtimeNow=[Diagnostics.Stopwatch]::GetTimestamp()
+            $runtimeAge=if($script:lastRuntimeCheck -eq 0){[double]::PositiveInfinity}else{($runtimeNow-$script:lastRuntimeCheck)*1000.0/[Diagnostics.Stopwatch]::Frequency}
+            if ($runtimeAge -ge 500) {
+                $script:runtimeLoaded=VR-Runtime-Loaded
+                $script:lastRuntimeCheck=$runtimeNow }
+        }
+        if ($script:mode -eq "scanned" -and -not $script:runtimeLoaded) {
+            $script:stableReady=0; $script:stableSince=0L
+            $script:lastTrans=-1L; $script:needRel=$false
+            if ($active -eq 1) {
+                Show-State "red" "No VR runtime" "Neither the Oculus nor the SteamVR runtime is loaded in the game." }
+            else { Show-State "amber" "Ready - start VR" $ready $warn }
+            return }
+
+        if ($active -eq 1 -and $wno -ne 0) {
+            $script:stableReady=0; $script:stableSince=0L
+            Show-State "red" "Not active" "VR started before the patch could take effect. Close HITMAN, start this tool first, then the game."
+            return }
+
+        $sync=Sync-RenderValues $d
+        if (-not $sync.Error -and $sync.Initialized -and $sync.Fixed) {
+            Ensure-RendererGuard $d | Out-Null
+            # Only now may the guard write on its own thread: both fields are
+            # owned, were written by the validated transaction and read back
+            # clean. The guard never does anything but restore these bytes.
+            if ($null -ne $script:rendererGuard -and $script:scaleTouched -and $script:maskTouched) {
+                try { $script:rendererGuard.Arm() } catch {} } }
+        if ($sync.Wrote) {
+            $script:pendingValueWrite=$true
+            # Close the read/write race: classify the write using a fresh state
+            # sample. The renderer may have reached transition 3 while the two
+            # value groups were being written.
+            $active=U8  $script:handle ($d+$OFF_ACTIVE)
+            $wno   =U8  $script:handle ($d+$script:wnoOff)
+            $trans =U32 $script:handle ($d+$OFF_TRANS)
+            $layers=U16 $script:handle ($d+$OFF_LAYERS)
+            $tex   =I64 $script:handle ($d+$OFF_TEX)
+            $w     =U32 $script:handle ($d+$OFF_W)
+            $h     =U32 $script:handle ($d+$OFF_H) }
+
+        if ($active -eq 1 -and $wno -ne 0) {
+            $script:stableReady=0; $script:stableSince=0L
+            Show-State "red" "Not active" "VR started before the patch could take effect. Close HITMAN, start this tool first, then the game."
+            return }
+
+        # Every tick, whether or not a callback arrived.
+        Update-RendererGuardState
+        if ($script:guardError) {
+            Stop-RendererGuard | Out-Null
+            $script:fatal=("The continuous renderer guard stopped after a validated sync error: {0}" -f $script:guardError)
+            Show-State "red" "Renderer guard stopped" $script:fatal $warn
+            return }
+        if ($script:guardWritePending) {
+            $script:pendingValueWrite=$true
+            $script:guardWritePending=$false }
+
+        # A direct repair disturbs the image, so the stable countdown restarts -
+        # but it is NOT fed to Advance-Lifecycle, because its transition was
+        # sampled by the guard and may no longer be the one we can read now.
+        if ($script:guardDirectRepair) {
+            $script:stableReady=0; $script:stableSince=0L
+            $script:guardDirectRepair=$false }
+
+        $life=Advance-Lifecycle $script:lastTrans $script:needRel $trans $script:pendingValueWrite
+
+        # A guard repair classified at transition 3 must survive the gap to the
+        # 15 ms lifecycle sample. Keep it latched through the following non-3
+        # rebuild phase and clear it only once that cycle reaches transition 3.
+        $life=Apply-GuardReloadLatch $life $trans
+        if ($life.TransitionChanged) {
+            Log ("transition {0} -> {1}" -f $script:lastTrans,$trans) }
+        $script:lastTrans=$life.LastTransition
+        $script:needRel=$life.NeedReload
+        $script:pendingValueWrite=$false
+        if ($life.ResetStable) { $script:stableReady=0; $script:stableSince=0L }
+
+        if ($sync.Wrote) {
+            $now=Get-Date
+            if (($now-$script:lastWriteLog).TotalSeconds -ge 1) {
+                Log ("values synchronised, transition={0}, active={1}" -f $trans,$active)
+                $script:lastWriteLog=$now } }
+
+        if ($sync.Error) {
+            $script:stableReady=0; $script:stableSince=0L
+            Show-State "red" "Renderer write failed" $sync.Error $warn
+            return }
+
+        if ($active -ne 1) {
+            $script:stableReady=0; $script:stableSince=0L
+            Show-State "amber" "Ready - start VR" $ready $warn; return }
+
+        if (-not $sync.Initialized -or -not $sync.Fixed) {
+            $script:stableReady=0; $script:stableSince=0L
+            Show-State "amber" "Waiting for the VR renderer" "The device is still initialising. The fix will arm before its render state is built." $warn
+            return }
+
+        if ($trans -ne 3 -or $layers -ne 2 -or $tex -eq 0) {
+            $script:stableReady=0; $script:stableSince=0L
+            Show-State "amber" "Waiting for a mission" "VR is running in two-layer mode. Load a mission and the fix becomes active." $warn
+            return }
+
+        if (-not $hookState.Ready) {
+            $script:stableReady=0; $script:stableSince=0L
+            Show-State "amber" "Waiting for the scene renderer" "The refraction wrapper and guard are installed. Load a mission so the glass/water pass runs once." $warn
+            return }
+
+        if ($script:needRel) {
+            $script:stableReady=0; $script:stableSince=0L
+            Show-State "amber" "Reload this mission once" "The fix is set, but this mission was already running when it was applied. Reload it once and the image will be sharp everywhere." $warn
+        } else {
+            $stableNow=[Diagnostics.Stopwatch]::GetTimestamp()
+            if ($script:stableSince -eq 0) { $script:stableSince=$stableNow }
+            if ($script:stableReady -lt 3) { $script:stableReady++ }
+            $stableMs=($stableNow-$script:stableSince)*1000.0/[Diagnostics.Stopwatch]::Frequency
+            if ($script:stableReady -lt 3 -or $stableMs -lt 250) {
+                Show-State "amber" "Finishing the mission load" "The render values are correct. Waiting briefly to make sure they remain stable." $warn
+            } else {
+                Show-State "green" "Active" ("Sharp from edge to edge at {0} x {1} per eye. Glass, water and refraction use the corrected two-eye copy path; the 1 ms save-load guard is running." -f $w,$h) $warn } }
+    } catch {
+        Show-State "red" "Something went wrong" ($_.Exception.Message + "  Close HITMAN and try again.") }
+})
+$timer.Start()
+
+$btnStop.Add_Click({
+    if ($script:unsafeCodeState -and (Game-IsAlive)) {
+        Show-State "red" "End HITMAN in Task Manager" "The failed rollback remains deliberately suspended. Force-close the HITMAN process; do not resume it." $MODE_INFO.Warning
+        return }
+    $restored=Restore
+    if (-not $restored) {
+        if ($script:unsafeCodeState) {
+            Show-State "red" "End HITMAN in Task Manager" $script:fatal
+        } else {
+            Show-State "amber" "Close HITMAN or retry" $script:fatal }
+        return }
+    Detach
+    $script:stopped=$true; $script:fatal=""
+    $btnStop.Enabled=$false
+    Show-State "grey" "Turned off" "Everything owned by v1.5 was restored. Close and reopen this tool to use the fix again." })
+
+$form.Add_FormClosing({ param($sender,$eventArgs)
+    if ($script:unsafeCodeState -and (Game-IsAlive)) {
+        $eventArgs.Cancel=$true
+        Show-State "red" "End HITMAN in Task Manager" "The failed rollback remains deliberately suspended. Force-close the HITMAN process; do not resume it." $MODE_INFO.Warning
+        Log "window close deferred while an unsafe rollback state remains suspended"
+        return }
+    $timer.Stop()
+    if ((Game-IsAlive) -and (Changes-MayBeLive) -and -not (Restore)) {
+        $eventArgs.Cancel=$true
+        $timer.Start()
+        if ($script:unsafeCodeState) {
+            Show-State "red" "End HITMAN in Task Manager" $script:fatal
+        } else {
+            Show-State "amber" "Close HITMAN or retry" $script:fatal }
+        Log "window close deferred because live restoration was incomplete"
+        return }
+    Detach
+    if ($script:handle -ne [IntPtr]::Zero) { [HmFix]::CloseHandle($script:handle) | Out-Null }
+    if ($script:mutexOwned) {
+        try { $script:instanceMutex.ReleaseMutex() } catch {}
+        $script:mutexOwned=$false }
+    try { $script:instanceMutex.Dispose() } catch {}
+    Log "closed" })
+
+[void]$form.ShowDialog()
