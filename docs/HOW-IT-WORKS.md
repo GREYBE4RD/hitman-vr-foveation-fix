@@ -37,7 +37,8 @@ software blur is the only thing left — and it is very visible.
 ## 2. What the fix does
 
 Switch the renderer to **two slices at full resolution**, covering the whole field of
-view. Five instructions and three values.
+view. v1.5 patches six instructions and maintains the renderer Scale/Mask fields
+while VR is active.
 
 Note on cost, since this is easy to get wrong: it is **twice** the pixel work, not
 the same. Each slice doubles in both dimensions while the slice count halves — four
@@ -54,12 +55,13 @@ percent apart. The old sweet-spot sharpness, everywhere.
 | `0x012C1EAC` | `0F B6 87 1B 03 00 00` | `B8 01 00 00 00 90 90` | constant-buffer flag = 1, raises the shader's radius limit so the image fills the field of view instead of leaving a black border — **Oculus device** |
 | `0x012499CC` | `0F B6 87 1B 03 00 00` | `B8 01 00 00 00 90 90` | the same thing again for the **OpenVR device** |
 | `0x01161FE9` | `80 B8 1B 03 00 00 00` | `48 85 E4 90 90 90 90` | **view count 4** — see below |
+| `0x01162E3C` | `80 B9 1B 03 00 00 00` | `48 85 E4 90 90 90 90` | **second view count 4** — fills both eyes correctly |
 
 `48 85 E4` is `test %rsp,%rsp`. It clears the zero flag without touching any register,
 so the `cmovne` that follows always fires.
 
-The last two are the same method in two different classes. Both device classes
-carry it at vtable slot `+0x208`:
+The two field-of-view flag patches are the same method in two different classes. Both
+device classes carry it at vtable slot `+0x208`:
 
 ```
 ZRenderVRDeviceOculus  vtable RVA 0x1F016C0  +0x208 -> 0x12C1CB0  (0x12C1EAC)
@@ -67,7 +69,7 @@ ZRenderVRDeviceOpenVR  vtable RVA 0x1EFE020  +0x208 -> 0x12497D0  (0x12499CC)
 ```
 
 Patch only one and the other backend keeps its narrow field of view. Everything
-else — the device layout, the field offsets, the other three patches — is shared
+else — the device layout, the field offsets, the other four base patches — is shared
 between them, which was confirmed by comparing probe reports from both runtimes on
 the same machine.
 
@@ -86,18 +88,26 @@ transition at 15 ms, writes as soon as the device geometry is plausible (includi
 before `active=1`), reads the values back, and requires multiple samples plus a
 250 ms monotonic stable window before showing green.
 
-Windows v1.4 also starts a separate sleeping guard after the first successful
-`Initialized && Fixed` renderer transaction. Its one-millisecond fast path reads only
-`device+0x490` (16 bytes) and `device+0x4C0` (8 bytes). Matching values cause no
-write and no UI work. A mismatch posts one callback to the WinForms thread and that
-callback reuses the complete validation, ownership, write, verification and rollback
-routine above. The 15 ms timer and callback therefore cannot write concurrently.
+Windows v1.5 starts a separate renderer guard after the normal validated transaction has
+claimed and verified both Scale and Mask for the current device. The guard watches only
+`device+0x490` (16 bytes) and `device+0x4C0` (8 bytes) on a high-resolution ~1 ms
+waitable timer when the OS provides one. Matching values cause no write.
 
-If that guard transaction writes while transition 3 is visible, v1.4 records the
-fact in a separate latch. The latch survives a later 15 ms sample of transition 1 or
-2 and is cleared only after the newly observed load cycle reaches transition 3. This
-closes the save-load window without turning the whole UI/lifecycle timer into a
-one-millisecond busy loop.
+A mismatch is only a trigger. Before writing, the guard takes the same writer lock as
+the 15 ms PowerShell lifecycle and revalidates the current device pointer, device vtable,
+field-of-view block, Scale and Mask. It then re-reads each target immediately before the
+write, writes only the already-owned fix bytes, and verifies the result. The guard never
+captures stock values and never performs restore work.
+
+If a write leaves a target in a state that is neither the requested fix nor the exact
+pre-write value, or if a post-write verification cannot establish the result, the guard
+faults and disarms. The normal renderer transaction checks that fault while holding the
+same lock, so it cannot write over an unknown state afterwards.
+
+Direct repairs are recorded on the guard thread together with the renderer transition
+visible at the time of the write. The 15 ms lifecycle drains those counters and latches
+independently of WinForms callback delivery. The callback remains useful for prompt
+full-path synchronization, but it is not part of the time-critical direct-write path.
 
 This lifecycle has been visually verified in the headset across new missions,
 mission restarts, save-game loads, scene changes and Freelancer mode.
@@ -138,6 +148,38 @@ central view-matrix accessor at `0x1306EFC` masks requested indices with `& 1` w
 WNO is off, so view 2 maps to eye 0 and view 3 maps to eye 1. v1.4 documents and
 handles the important exception: `CopyRefractionDepth` consumes the numeric context
 count through a fullscreen instance multiplier and therefore must see 2, not 4.
+
+### There are two of them
+
+The same count is set up a second time, about 3.6 KB further on, and v1.3 only found
+the first:
+
+```
+0x1162E33  mov    0x141A0(%r13),%rcx  ; VR device
+0x1162E3A  je     0x1162E56           ; no VR -> 1
+0x1162E3C  cmpb   $0, 0x31B(%rcx)     ; WNO flag
+0x1162E43  mov    $0x2,%edi           ; default 2
+0x1162E48  mov    $0x4,%eax
+0x1162E4D  cmovne %eax,%edi           ; WNO on -> 4
+0x1162E50  mov    %edi,0x78(%rsp)     ; the count
+```
+
+Instruction for instruction the same shape as `0x1161FE9`, and it takes the same fix.
+The symptom it caused is different and much easier to miss: **one eye keeps a black
+oval mask around the edge of its field of view**, while the other eye fills the frame.
+Instinct outlines smear into the black band, because that pass draws without the same
+limit. Which eye is affected is not fixed — it depends on which eye the single stored
+per-eye FovPort belongs to, so different headsets and runtimes lose different eyes.
+
+It was found by sweeping. There are 30 places that read the WNO flag; v1.3 patched
+three. Forcing the remaining 27 back to "foveation is on", one group at a time, and
+looking for the mask to disappear, took two rounds: nine groups, then three single
+instructions.
+
+The lesson from section 5 held again. Three static hypotheses were tested first — the
+composite constant buffer, the FovPort pair at `+0x410`/`+0x420`, and the second
+unpatched reader in the same function — and all three were wrong. The sweep found it
+in two attempts.
 
 ---
 
