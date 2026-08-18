@@ -1,0 +1,45 @@
+name: Publish v1.5
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/publish-v1.5.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 071a29ce4ed5b737bf98318077b27c7a7c8602e3
+      - name: Verify release source
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s  %s\n' '02eca202a17074c275c02e0dd6a852b75a52fdef96595e74cb39e201adee9c25' 'HitmanVRFoveationFix.ps1' | sha256sum --check --strict
+      - name: Build minimal Windows package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/HitmanVRFoveationFix-v1.5
+          cp HitmanVRFoveationFix.ps1 HitmanVRFoveationFix.bat README.md CHANGELOG-v1.5.md LICENSE dist/HitmanVRFoveationFix-v1.5/
+          cd dist
+          zip -r -9 HitmanVRFoveationFix-v1.5.zip HitmanVRFoveationFix-v1.5
+          sha256sum HitmanVRFoveationFix-v1.5.zip | tee HitmanVRFoveationFix-v1.5.zip.sha256
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view v1.5 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload v1.5 dist/HitmanVRFoveationFix-v1.5.zip dist/HitmanVRFoveationFix-v1.5.zip.sha256 --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit v1.5 --title 'HitmanVRFoveationFix v1.5' --notes-file CHANGELOG-v1.5.md --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create v1.5 dist/HitmanVRFoveationFix-v1.5.zip dist/HitmanVRFoveationFix-v1.5.zip.sha256 --target 071a29ce4ed5b737bf98318077b27c7a7c8602e3 --title 'HitmanVRFoveationFix v1.5' --notes-file CHANGELOG-v1.5.md --repo "$GITHUB_REPOSITORY"
+          fi
