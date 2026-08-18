@@ -1,0 +1,352 @@
+<#
+    HitmanVRFoveationFix v1.5
+
+    v1.5 adds two things to v1.4:
+
+      - A SECOND view-count site. The game sets up its 1/2/4 view count in two
+        places; v1.3 found one of them. The other kept pushing 2 and left an
+        oval black mask on one eye, with Instinct outlines smearing into it.
+        Found by sweeping the 27 unpatched readers of the foveation flag, in two
+        rounds. Same instruction shape and same safety argument as the first.
+
+      - The ~1 ms renderer guard now repairs on its own thread. It still only
+        rewrites bytes the validated transaction already owns, but it no longer
+        waits for the WinForms queue first. On a fast machine the renderer could
+        build its GPU state inside that window, which is what produced black
+        circles after loading a save for some people and not for others.
+
+    v1.4, unchanged and still here:
+
+      - Refraction-depth copies use the two physical eye views while the
+        geometry/visibility renderer keeps its required four logical views.
+        This fixes stereo glass, water, bottles and affected lights without
+        reintroducing geometry pop-in.
+
+    WHAT IT DOES
+      HITMAN renders VR with foveation: four layers per frame, two wide ones at
+      half resolution covering the whole field of view, and two narrow ones at
+      full resolution covering only a small circle in the centre. Everything
+      outside that circle is upscaled from the half-resolution layer, which is
+      why it looks like mush on a high resolution headset.
+
+      This tool switches the game to two layers at full resolution instead,
+      covering the whole field of view. That is twice the pixel work - four
+      quarter-sized slices against two full-sized ones - but the density is what
+      matters: 936 px across the old ~49 degree circle is 19.1 px per degree,
+      1872 px across the full 99 degrees is 18.9. About a percent apart. You get
+      the old sweet-spot sharpness, everywhere.
+
+    HOW TO USE IT
+      1. Start this tool
+      2. Start HITMAN - however you like, including straight into VR
+      3. Play
+
+    BUILD HANDLING
+      Build 3.270.1 uses the exact addresses and instruction contexts that were
+      developed and tested. Other builds retain the conservative v1.3 pattern
+      path: every base and refraction hook pattern must be unique, mutually
+      consistent and in its original state or the tool refuses to write.
+
+    SUPPORTED HEADSETS
+      Both VR backends the game speaks are supported:
+
+        Oculus  - Quest 2, Quest 3, Quest 3S, Quest Pro, Rift S, via Link or
+                  Air Link
+        SteamVR - anything that presents itself through OpenVR, including Quest
+                  headsets connected with Steam Link or Virtual Desktop
+
+      The device layout turned out to be identical between the two, so the same
+      values work for both. The code is not quite identical though: each backend
+      has its own device class with its own copy of one function, so that one is
+      patched twice, once per class. HITMAN has no OpenXR backend at all, so
+      launching through an OpenXR runtime lands on SteamVR anyway.
+
+    WHAT IT TOUCHES
+      No game file or setting is modified. The tool writes a small
+      foveationfix.log next to itself for diagnostics. All renderer changes are
+      made in the memory of the running process and are gone the moment you
+      close HITMAN.
+
+      It does write to the memory of a game that has an online connection. That
+      is said plainly because you should know it. Use at your own discretion.
+
+    Project page: https://github.com/RealChrizzl/hitman-vr-foveation-fix
+    MIT licensed. Made by RealChrizzl.
+#>
+
+[CmdletBinding()]
+param([string]$ProcessName = "HITMAN3")
+
+$ErrorActionPreference = "Stop"
+
+$FIX_VERSION = "1.5"
+$MODE_INFO = [pscustomobject]@{
+    Short="v1.5"
+    Title="HitmanVRFoveationFix v1.5"
+    Warning=""
+    UsesHook=$true
+    HookKinds=@("Outer","CopyA","CopyB")
+    OuterChangesCount=$false
+    CopyFrom=4
+    CopyTo=2
+    UsesMesh4=$false
+}
+
+# Reading another process's memory needs administrator rights. If we do not
+# have them, ask Windows for them once and restart ourselves.
+$me = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    $self = $PSCommandPath
+    if (-not $self) { $self = $MyInvocation.MyCommand.Definition }
+    try {
+        Start-Process -FilePath "powershell.exe" -Verb RunAs -ArgumentList @(
+            "-NoProfile","-ExecutionPolicy","Bypass","-WindowStyle","Hidden",
+            "-File","`"$self`"","-ProcessName","`"$ProcessName`"")
+    } catch {
+        Add-Type -AssemblyName System.Windows.Forms
+        [Windows.Forms.MessageBox]::Show(
+            "This tool needs administrator rights to read the game's memory.`n`nPlease allow the prompt, or right-click the file and choose 'Run as administrator'.",
+            "HitmanVRFoveationFix","OK","Warning") | Out-Null
+    }
+    exit
+}
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+if (-not [Environment]::Is64BitProcess) {
+    [Windows.Forms.MessageBox]::Show(
+        "HitmanVRFoveationFix v1.5 requires 64-bit Windows PowerShell so live code changes can be verified safely.",
+        "HitmanVRFoveationFix","OK","Warning") | Out-Null
+    exit
+}
+
+# Two instances can both observe stock code before either writes it, then each
+# believe it owns the patch. A named mutex closes that race before any game
+# handle is opened.
+$script:instanceMutex=New-Object Threading.Mutex($false,"Local\HitmanVRFoveationFix")
+$script:mutexOwned=$false
+try { $script:mutexOwned=$script:instanceMutex.WaitOne(0,$false) }
+catch [Threading.AbandonedMutexException] { $script:mutexOwned=$true }
+if (-not $script:mutexOwned) {
+    [Windows.Forms.MessageBox]::Show(
+        "HitmanVRFoveationFix is already running in this Windows session.",
+        "HitmanVRFoveationFix","OK","Information") | Out-Null
+    $script:instanceMutex.Dispose()
+    exit
+}
+
+if (-not ("HmFix" -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Windows.Forms;
+using Microsoft.Win32.SafeHandles;
+public static class HmFix {
+    // A 1 ms Wait timeout is only as accurate as the system timer resolution,
+    // which is ~15.6 ms unless something raised it - and since Windows 10 2004
+    // another process raising it no longer helps this one. A high-resolution
+    // waitable timer is the documented way to actually get single-digit
+    // milliseconds without touching the global timer period.
+    public const uint CREATE_WAITABLE_TIMER_HIGH_RESOLUTION = 0x00000002;
+    public const uint TIMER_ALL_ACCESS = 0x001F0003;
+    [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+    public static extern IntPtr CreateWaitableTimerExW(IntPtr attributes, string name, uint flags, uint access);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool SetWaitableTimer(IntPtr timer, ref long dueTime, int period,
+        IntPtr routine, IntPtr arg, bool resume);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern IntPtr OpenProcess(uint a, bool i, int p);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool ReadProcessMemory(IntPtr h, IntPtr addr, byte[] buf, int size, out IntPtr read);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool WriteProcessMemory(IntPtr h, IntPtr addr, byte[] buf, int size, out IntPtr written);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool FlushInstructionCache(IntPtr h, IntPtr addr, UIntPtr size);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern IntPtr VirtualAllocEx(IntPtr h, IntPtr addr, UIntPtr size, uint allocationType, uint protect);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool VirtualProtectEx(IntPtr h, IntPtr addr, UIntPtr size, uint newProtect, out uint oldProtect);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern IntPtr OpenThread(uint access, bool inheritHandle, uint threadId);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern uint SuspendThread(IntPtr thread);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern uint ResumeThread(IntPtr thread);
+    [DllImport("kernel32.dll", EntryPoint="GetThreadContext", SetLastError=true)]
+    private static extern bool GetThreadContextNative(IntPtr thread, IntPtr context);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool GetProcessMitigationPolicy(IntPtr process, uint policy, out uint buffer, UIntPtr length);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+    [DllImport("kernel32.dll")]
+    public static extern bool CloseHandle(IntPtr h);
+
+    // AMD64 CONTEXT is 16-byte aligned. ContextFlags is at +48 and RIP at
+    // +248. CONTEXT_CONTROL is sufficient and keeps this helper independent
+    // of the large floating-point/vector tail of the structure.
+    public static bool TryGetThreadRip(IntPtr thread, out ulong rip, out int error) {
+        const int SIZE = 0x4D0;
+        rip = 0; error = 0;
+        if (!Environment.Is64BitProcess) { error = 193; return false; }
+        IntPtr raw = Marshal.AllocHGlobal(SIZE + 15);
+        try {
+            long alignedValue = (raw.ToInt64() + 15L) & ~15L;
+            IntPtr aligned = new IntPtr(alignedValue);
+            for (int i = 0; i < SIZE; i += 8) Marshal.WriteInt64(aligned, i, 0L);
+            Marshal.WriteInt32(aligned, 0x30, unchecked((int)0x00100001u));
+            if (!GetThreadContextNative(thread, aligned)) {
+                error = Marshal.GetLastWin32Error(); return false;
+            }
+            rip = unchecked((ulong)Marshal.ReadInt64(aligned, 0xF8));
+            return true;
+        } finally { Marshal.FreeHGlobal(raw); }
+    }
+}
+
+// The fast renderer guard watches the 16-byte scale and 8-byte mask fields on a
+// 1 ms thread. Once PowerShell has established ownership of those fields it arms
+// the guard, and from then on a mismatch is repaired ON THE GUARD THREAD instead
+// of waiting for the WinForms message queue. That is the whole point: on a fast
+// machine the renderer can finish building its GPU state inside the window that
+// BeginInvoke plus a PowerShell tick costs.
+//
+// The 1 ms is real, not hoped for. A high-resolution waitable timer is used when
+// the OS provides one, and the loop measures its own interval, so the log says
+// whether the guard actually ran at 1 ms on this machine or fell back to the
+// system timer resolution. A high-resolution timer still does not make the
+// scheduler exact; that is precisely why the interval is measured rather than
+// assumed.
+//
+// The repair is deliberately the weakest possible write:
+//   - armed only after the validated transaction wrote BOTH fields for this
+//     device and read them back clean
+//   - the device pointer and the device vtable are re-checked before writing
+//   - field of view, scale and mask are re-validated against exactly the same
+//     plausibility bounds the PowerShell transaction uses, so a device block that
+//     is mid-rebuild or half-constructed is left alone
+//   - it never captures stock values, never rolls back, never initialises
+//   - it rewrites nothing but the exact fix bytes it was given
+//   - it takes the same lock PowerShell uses, and only with TryEnter
+//   - it reads back after every write attempt, including a failed or short one,
+//     and distinguishes "took", "did not take" and "unknown". An unknown state
+//     disarms the guard and raises a fault instead of trying again
+//   - a repair is counted only when a field really changed, so contention with
+//     PowerShell cannot inflate the counter or trip the reload latch
+//
+// The transition value is sampled by the guard itself, immediately after a
+// successful write. Reading it later on the WinForms thread would be a race: the
+// renderer can leave transition 3 before the callback is dispatched.
+public sealed class RendererValueGuard : IDisposable {
+    private const int FIELD_OK        = 0;   // already correct, nothing done
+    private const int FIELD_WRITTEN   = 1;   // changed by us and verified
+    private const int FIELD_SKIPPED   = 2;   // not read, or not plausible: untouched
+    private const int FIELD_UNCHANGED = 3;   // write did not take; memory as before
+    private const int FIELD_UNKNOWN   = 4;   // state after a write attempt is unknown
+
+    private readonly IntPtr process;
+    private readonly long device;
+    private readonly long devicePointer;
+    private readonly long expectedVtable;
+    private readonly long fovOffset;
+    private readonly long scaleOffset;
+    private readonly long maskOffset;
+    private readonly long transitionOffset;
+    private readonly byte[] expectedScale;
+    private readonly byte[] expectedMask;
+    private readonly Control dispatcher;
+    private readonly Action<RendererValueGuard> callback;
+    private readonly object gate;
+    private readonly ManualResetEvent stop = new ManualResetEvent(false);
+    private readonly ManualResetEvent ready = new ManualResetEvent(false);
+    private readonly Thread thread;
+    private int signalPending;
+    private int stopped;
+    private int armed;
+    private int transition3Repair;
+    private int partialWrite;
+    private int highResolution;
+    private long reads;
+    private long mismatches;
+    private long readFailures;
+    private long repairs;
+    private long repairFailures;
+    private long slowIntervals;
+    private long maxIntervalMicroseconds;
+
+    public RendererValueGuard(IntPtr process, long device, long devicePointer,
+        long expectedVtable, long fovOffset, long scaleOffset, long maskOffset,
+        long transitionOffset, byte[] expectedScale, byte[] expectedMask,
+        Control dispatcher, Action<RendererValueGuard> callback, object gate) {
+        if (process == IntPtr.Zero) throw new ArgumentException("process");
+        if (device == 0) throw new ArgumentException("device");
+        if (devicePointer == 0) throw new ArgumentException("devicePointer");
+        // No silent downgrade: without a vtable to compare against, the guard has
+        // no way to notice a released device and must not run at all.
+        if (expectedVtable == 0) throw new ArgumentException("expectedVtable");
+        if (expectedScale == null || expectedScale.Length != 16) throw new ArgumentException("scale");
+        if (expectedMask == null || expectedMask.Length != 8) throw new ArgumentException("mask");
+        if (dispatcher == null || callback == null || gate == null) throw new ArgumentNullException();
+        this.process = process;
+        this.device = device;
+        this.devicePointer = devicePointer;
+        this.expectedVtable = expectedVtable;
+        this.fovOffset = fovOffset;
+        this.scaleOffset = scaleOffset;
+        this.maskOffset = maskOffset;
+        this.transitionOffset = transitionOffset;
+        this.expectedScale = (byte[])expectedScale.Clone();
+        this.expectedMask = (byte[])expectedMask.Clone();
+        this.dispatcher = dispatcher;
+        this.callback = callback;
+        this.gate = gate;
+        thread = new Thread(Run);
+        thread.IsBackground = true;
+        thread.Name = "HitmanVR renderer guard";
+    }
+
+    public long Device { get { return device; } }
+    public bool IsRunning { get { return Volatile.Read(ref stopped) == 0 && thread.IsAlive; } }
+    public long Reads { get { return Interlocked.Read(ref reads); } }
+    public long Mismatches { get { return Interlocked.Read(ref mismatches); } }
+    public long ReadFailures { get { return Interlocked.Read(ref readFailures); } }
+    public long Repairs { get { return Interlocked.Read(ref repairs); } }
+    public long RepairFailures { get { return Interlocked.Read(ref repairFailures); } }
+    public long SlowIntervals { get { return Interlocked.Read(ref slowIntervals); } }
+    public long MaxIntervalMicroseconds { get { return Interlocked.Read(ref maxIntervalMicroseconds); } }
+    public bool HighResolutionTimer { get { return Volatile.Read(ref highResolution) != 0; } }
+    public bool IsArmed { get { return Volatile.Read(ref armed) != 0; } }
+
+    public void Arm() { Interlocked.Exchange(ref armed, 1); }
+    public void Disarm() { Interlocked.Exchange(ref armed, 0); }
+
+    // True once, if a repair landed while the renderer was at transition 3.
+    public bool ConsumeTransition3Repair() {
+        return Interlocked.Exchange(ref transition3Repair, 0) != 0;
+    }
+
+    // True once, if a write left a field in a state that is neither the value we
+    // wanted nor the value that was there before. The guard has disarmed itself.
+    public bool ConsumePartialWriteFault() {
+        return Interlocked.Exchange(ref partialWrite, 0) != 0;
+    }
+
+    // Non-consuming, for the PowerShell transaction to test while it holds the
+    // shared lock. The guard sets the fault while it holds that same lock, so
+    // whoever acquires it next is guaranteed to see it and can refuse to write.
+    public bool HasFault { get { return Volatile.Read(ref partialWrite) != 0; } }
+
+    // Blocks briefly so HighResolutionTimer is meaningful straight afterwards.
+    public void Start() {
+        thread.Start();
+        try { ready.WaitOne(500); } catch { }
+    }
+
+    private static bool EqualBytes(byte[] left, byte[] right) {
+        if (left.Length != right.Length) return false;
+        for (int i = 0; i < left.Length; i++) if (left[i] != right[i]) return false;
+        return true;
+    }
+
+    // Exactly the bounds Sync-RenderValuesCore uses. A device block that is being
