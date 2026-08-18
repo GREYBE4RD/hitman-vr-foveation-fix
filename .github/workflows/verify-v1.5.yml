@@ -1,0 +1,60 @@
+name: Verify v1.5 release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/verify-v1.5.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Verify published release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p verify
+          gh release view v1.5 --repo "$GITHUB_REPOSITORY" --json name,tagName,targetCommitish,assets > verify/release.json
+          gh release download v1.5 --repo "$GITHUB_REPOSITORY" --pattern 'HitmanVRFoveationFix-v1.5.zip' --dir verify
+          rm -rf verify/unpacked
+          mkdir -p verify/unpacked
+          unzip -q verify/HitmanVRFoveationFix-v1.5.zip -d verify/unpacked
+          mapfile -t files < <(cd verify/unpacked && find . -type f -printf '%P\n' | sort)
+          expected=(
+            'HitmanVRFoveationFix-v1.5/CHANGELOG-v1.5.md'
+            'HitmanVRFoveationFix-v1.5/HitmanVRFoveationFix.bat'
+            'HitmanVRFoveationFix-v1.5/HitmanVRFoveationFix.ps1'
+            'HitmanVRFoveationFix-v1.5/LICENSE'
+            'HitmanVRFoveationFix-v1.5/README.md'
+          )
+          test "${#files[@]}" -eq "${#expected[@]}"
+          for i in "${!expected[@]}"; do test "${files[$i]}" = "${expected[$i]}"; done
+          printf '%s  %s\n' '02eca202a17074c275c02e0dd6a852b75a52fdef96595e74cb39e201adee9c25' 'verify/unpacked/HitmanVRFoveationFix-v1.5/HitmanVRFoveationFix.ps1' | sha256sum --check --strict
+          {
+            echo 'v1.5 release verified'
+            echo "release_zip_sha256=$(sha256sum verify/HitmanVRFoveationFix-v1.5.zip | cut -d' ' -f1)"
+            echo 'windows_ps1_sha256=02eca202a17074c275c02e0dd6a852b75a52fdef96595e74cb39e201adee9c25'
+            echo 'asset_files=5'
+            cat verify/release.json
+          } > RELEASE-VERIFIED-v1.5.txt
+      - name: Commit verification and remove temporary workflows
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add RELEASE-VERIFIED-v1.5.txt
+          git rm -f .github/workflows/verify-v1.5.yml .github/workflows/publish-v1.5.yml
+          git commit -m 'Verify v1.5 release and clean release workflows [skip ci]'
+          git push origin HEAD:main
