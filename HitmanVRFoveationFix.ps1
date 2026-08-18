@@ -1,17 +1,26 @@
 <#
-    HitmanVRFoveationFix v1.4
+    HitmanVRFoveationFix v1.5
 
-    v1.4 adds two deliberately separate fixes to the proven v1.3 base:
+    v1.5 adds two things to v1.4:
+
+      - A SECOND view-count site. The game sets up its 1/2/4 view count in two
+        places; v1.3 found one of them. The other kept pushing 2 and left an
+        oval black mask on one eye, with Instinct outlines smearing into it.
+        Found by sweeping the 27 unpatched readers of the foveation flag, in two
+        rounds. Same instruction shape and same safety argument as the first.
+
+      - The ~1 ms renderer guard now repairs on its own thread. It still only
+        rewrites bytes the validated transaction already owns, but it no longer
+        waits for the WinForms queue first. On a fast machine the renderer could
+        build its GPU state inside that window, which is what produced black
+        circles after loading a save for some people and not for others.
+
+    v1.4, unchanged and still here:
 
       - Refraction-depth copies use the two physical eye views while the
         geometry/visibility renderer keeps its required four logical views.
         This fixes stereo glass, water, bottles and affected lights without
         reintroducing geometry pop-in.
-
-      - A sleeping ~1 ms guard watches only the 24 critical renderer bytes.
-        It performs no writes while they are correct. If HITMAN briefly restores
-        its foveation values during a save load, the guard hands the repair to
-        the same validated sync/write/verify/rollback routine as the 15 ms loop.
 
     WHAT IT DOES
       HITMAN renders VR with foveation: four layers per frame, two wide ones at
@@ -70,10 +79,10 @@ param([string]$ProcessName = "HITMAN3")
 
 $ErrorActionPreference = "Stop"
 
-$FIX_VERSION = "1.4"
+$FIX_VERSION = "1.5"
 $MODE_INFO = [pscustomobject]@{
-    Short="v1.4"
-    Title="HitmanVRFoveationFix v1.4"
+    Short="v1.5"
+    Title="HitmanVRFoveationFix v1.5"
     Warning=""
     UsesHook=$true
     HookKinds=@("Outer","CopyA","CopyB")
@@ -106,7 +115,7 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 if (-not [Environment]::Is64BitProcess) {
     [Windows.Forms.MessageBox]::Show(
-        "HitmanVRFoveationFix v1.4 requires 64-bit Windows PowerShell so live code changes can be verified safely.",
+        "HitmanVRFoveationFix v1.5 requires 64-bit Windows PowerShell so live code changes can be verified safely.",
         "HitmanVRFoveationFix","OK","Warning") | Out-Null
     exit
 }
@@ -129,10 +138,24 @@ if (-not $script:mutexOwned) {
 if (-not ("HmFix" -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows.Forms;
+using Microsoft.Win32.SafeHandles;
 public static class HmFix {
+    // A 1 ms Wait timeout is only as accurate as the system timer resolution,
+    // which is ~15.6 ms unless something raised it - and since Windows 10 2004
+    // another process raising it no longer helps this one. A high-resolution
+    // waitable timer is the documented way to actually get single-digit
+    // milliseconds without touching the global timer period.
+    public const uint CREATE_WAITABLE_TIMER_HIGH_RESOLUTION = 0x00000002;
+    public const uint TIMER_ALL_ACCESS = 0x001F0003;
+    [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+    public static extern IntPtr CreateWaitableTimerExW(IntPtr attributes, string name, uint flags, uint access);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool SetWaitableTimer(IntPtr timer, ref long dueTime, int period,
+        IntPtr routine, IntPtr arg, bool resume);
     [DllImport("kernel32.dll", SetLastError=true)]
     public static extern IntPtr OpenProcess(uint a, bool i, int p);
     [DllImport("kernel32.dll", SetLastError=true)]
@@ -182,43 +205,102 @@ public static class HmFix {
     }
 }
 
-// The fast renderer guard never writes process memory. Its background thread
-// reads only the 16-byte scale and 8-byte mask fields. A mismatch is marshalled
-// once to the WinForms thread, where PowerShell runs the existing validated
-// renderer transaction. This keeps PowerShell and all writes single-threaded.
+// The fast renderer guard watches the 16-byte scale and 8-byte mask fields on a
+// 1 ms thread. Once PowerShell has established ownership of those fields it arms
+// the guard, and from then on a mismatch is repaired ON THE GUARD THREAD instead
+// of waiting for the WinForms message queue. That is the whole point: on a fast
+// machine the renderer can finish building its GPU state inside the window that
+// BeginInvoke plus a PowerShell tick costs.
+//
+// The 1 ms is real, not hoped for. A high-resolution waitable timer is used when
+// the OS provides one, and the loop measures its own interval, so the log says
+// whether the guard actually ran at 1 ms on this machine or fell back to the
+// system timer resolution. A high-resolution timer still does not make the
+// scheduler exact; that is precisely why the interval is measured rather than
+// assumed.
+//
+// The repair is deliberately the weakest possible write:
+//   - armed only after the validated transaction wrote BOTH fields for this
+//     device and read them back clean
+//   - the device pointer and the device vtable are re-checked before writing
+//   - field of view, scale and mask are re-validated against exactly the same
+//     plausibility bounds the PowerShell transaction uses, so a device block that
+//     is mid-rebuild or half-constructed is left alone
+//   - it never captures stock values, never rolls back, never initialises
+//   - it rewrites nothing but the exact fix bytes it was given
+//   - it takes the same lock PowerShell uses, and only with TryEnter
+//   - it reads back after every write attempt, including a failed or short one,
+//     and distinguishes "took", "did not take" and "unknown". An unknown state
+//     disarms the guard and raises a fault instead of trying again
+//   - a repair is counted only when a field really changed, so contention with
+//     PowerShell cannot inflate the counter or trip the reload latch
+//
+// The transition value is sampled by the guard itself, immediately after a
+// successful write. Reading it later on the WinForms thread would be a race: the
+// renderer can leave transition 3 before the callback is dispatched.
 public sealed class RendererValueGuard : IDisposable {
+    private const int FIELD_OK        = 0;   // already correct, nothing done
+    private const int FIELD_WRITTEN   = 1;   // changed by us and verified
+    private const int FIELD_SKIPPED   = 2;   // not read, or not plausible: untouched
+    private const int FIELD_UNCHANGED = 3;   // write did not take; memory as before
+    private const int FIELD_UNKNOWN   = 4;   // state after a write attempt is unknown
+
     private readonly IntPtr process;
     private readonly long device;
+    private readonly long devicePointer;
+    private readonly long expectedVtable;
+    private readonly long fovOffset;
     private readonly long scaleOffset;
     private readonly long maskOffset;
+    private readonly long transitionOffset;
     private readonly byte[] expectedScale;
     private readonly byte[] expectedMask;
     private readonly Control dispatcher;
     private readonly Action<RendererValueGuard> callback;
+    private readonly object gate;
     private readonly ManualResetEvent stop = new ManualResetEvent(false);
+    private readonly ManualResetEvent ready = new ManualResetEvent(false);
     private readonly Thread thread;
     private int signalPending;
     private int stopped;
+    private int armed;
+    private int transition3Repair;
+    private int partialWrite;
+    private int highResolution;
     private long reads;
     private long mismatches;
     private long readFailures;
+    private long repairs;
+    private long repairFailures;
+    private long slowIntervals;
+    private long maxIntervalMicroseconds;
 
-    public RendererValueGuard(IntPtr process, long device, long scaleOffset,
-        long maskOffset, byte[] expectedScale, byte[] expectedMask,
-        Control dispatcher, Action<RendererValueGuard> callback) {
+    public RendererValueGuard(IntPtr process, long device, long devicePointer,
+        long expectedVtable, long fovOffset, long scaleOffset, long maskOffset,
+        long transitionOffset, byte[] expectedScale, byte[] expectedMask,
+        Control dispatcher, Action<RendererValueGuard> callback, object gate) {
         if (process == IntPtr.Zero) throw new ArgumentException("process");
         if (device == 0) throw new ArgumentException("device");
+        if (devicePointer == 0) throw new ArgumentException("devicePointer");
+        // No silent downgrade: without a vtable to compare against, the guard has
+        // no way to notice a released device and must not run at all.
+        if (expectedVtable == 0) throw new ArgumentException("expectedVtable");
         if (expectedScale == null || expectedScale.Length != 16) throw new ArgumentException("scale");
         if (expectedMask == null || expectedMask.Length != 8) throw new ArgumentException("mask");
-        if (dispatcher == null || callback == null) throw new ArgumentNullException();
+        if (dispatcher == null || callback == null || gate == null) throw new ArgumentNullException();
         this.process = process;
         this.device = device;
+        this.devicePointer = devicePointer;
+        this.expectedVtable = expectedVtable;
+        this.fovOffset = fovOffset;
         this.scaleOffset = scaleOffset;
         this.maskOffset = maskOffset;
+        this.transitionOffset = transitionOffset;
         this.expectedScale = (byte[])expectedScale.Clone();
         this.expectedMask = (byte[])expectedMask.Clone();
         this.dispatcher = dispatcher;
         this.callback = callback;
+        this.gate = gate;
         thread = new Thread(Run);
         thread.IsBackground = true;
         thread.Name = "HitmanVR renderer guard";
@@ -229,12 +311,51 @@ public sealed class RendererValueGuard : IDisposable {
     public long Reads { get { return Interlocked.Read(ref reads); } }
     public long Mismatches { get { return Interlocked.Read(ref mismatches); } }
     public long ReadFailures { get { return Interlocked.Read(ref readFailures); } }
+    public long Repairs { get { return Interlocked.Read(ref repairs); } }
+    public long RepairFailures { get { return Interlocked.Read(ref repairFailures); } }
+    public long SlowIntervals { get { return Interlocked.Read(ref slowIntervals); } }
+    public long MaxIntervalMicroseconds { get { return Interlocked.Read(ref maxIntervalMicroseconds); } }
+    public bool HighResolutionTimer { get { return Volatile.Read(ref highResolution) != 0; } }
+    public bool IsArmed { get { return Volatile.Read(ref armed) != 0; } }
 
-    public void Start() { thread.Start(); }
+    public void Arm() { Interlocked.Exchange(ref armed, 1); }
+    public void Disarm() { Interlocked.Exchange(ref armed, 0); }
+
+    // True once, if a repair landed while the renderer was at transition 3.
+    public bool ConsumeTransition3Repair() {
+        return Interlocked.Exchange(ref transition3Repair, 0) != 0;
+    }
+
+    // True once, if a write left a field in a state that is neither the value we
+    // wanted nor the value that was there before. The guard has disarmed itself.
+    public bool ConsumePartialWriteFault() {
+        return Interlocked.Exchange(ref partialWrite, 0) != 0;
+    }
+
+    // Non-consuming, for the PowerShell transaction to test while it holds the
+    // shared lock. The guard sets the fault while it holds that same lock, so
+    // whoever acquires it next is guaranteed to see it and can refuse to write.
+    public bool HasFault { get { return Volatile.Read(ref partialWrite) != 0; } }
+
+    // Blocks briefly so HighResolutionTimer is meaningful straight afterwards.
+    public void Start() {
+        thread.Start();
+        try { ready.WaitOne(500); } catch { }
+    }
 
     private static bool EqualBytes(byte[] left, byte[] right) {
         if (left.Length != right.Length) return false;
         for (int i = 0; i < left.Length; i++) if (left[i] != right[i]) return false;
+        return true;
+    }
+
+    // Exactly the bounds Sync-RenderValuesCore uses. A device block that is being
+    // rebuilt can hold zeroes or garbage, and that state is deliberately not ours.
+    private static bool FloatsInRange(byte[] b, int count, float lo, float hi) {
+        for (int i = 0; i < count; i++) {
+            float f = BitConverter.ToSingle(b, i * 4);
+            if (float.IsNaN(f) || float.IsInfinity(f) || f < lo || f > hi) return false;
+        }
         return true;
     }
 
@@ -244,11 +365,162 @@ public sealed class RendererValueGuard : IDisposable {
             buffer.Length, out read) && read.ToInt64() == buffer.Length;
     }
 
+    private bool WriteExact(long address, byte[] buffer) {
+        IntPtr written;
+        return HmFix.WriteProcessMemory(process, new IntPtr(address), buffer,
+            buffer.Length, out written) && written.ToInt64() == buffer.Length;
+    }
+
+    private bool ReadInt64(long address, byte[] scratch8, out long value) {
+        value = 0;
+        if (!ReadExact(address, scratch8)) return false;
+        value = BitConverter.ToInt64(scratch8, 0);
+        return true;
+    }
+
+    // The guard holds an address captured when it started. Between a device being
+    // released and the 15 ms loop noticing, that address could belong to nothing.
+    private bool DeviceStillCurrent(byte[] scratch8) {
+        long current;
+        if (!ReadInt64(devicePointer, scratch8, out current)) return false;
+        if (current != device) return false;
+        long vtable;
+        if (!ReadInt64(device, scratch8, out vtable)) return false;
+        return vtable == expectedVtable;
+    }
+
+    // The bytes checked for plausibility are the ones read here, immediately
+    // before the write - not the ones sampled a few microseconds earlier in
+    // TryRepair. That closes the window where a rebuild starts in between.
+    private int RepairField(long address, byte[] expected, byte[] scratch, byte[] before,
+                            int floatCount, float lo, float hi, byte[] scratch8) {
+        if (!ReadExact(address, scratch)) return FIELD_SKIPPED;
+        Buffer.BlockCopy(scratch, 0, before, 0, scratch.Length);
+        if (EqualBytes(scratch, expected)) return FIELD_OK;
+        if (!FloatsInRange(scratch, floatCount, lo, hi)) return FIELD_SKIPPED;
+        // Last look before touching anything.
+        if (!DeviceStillCurrent(scratch8)) return FIELD_SKIPPED;
+        // The return value is deliberately ignored: WriteProcessMemory can modify
+        // a prefix and still report a short write, so only a read-back is truth.
+        WriteExact(address, expected);
+        // A readback that fails AFTER a write attempt is not a harmless read
+        // error - the memory is in a state nobody has seen. Fail closed.
+        if (!ReadExact(address, scratch)) return FIELD_UNKNOWN;
+        if (EqualBytes(scratch, expected)) return FIELD_WRITTEN;
+        if (EqualBytes(scratch, before)) return FIELD_UNCHANGED;
+        return FIELD_UNKNOWN;
+    }
+
+    private void Fault() {
+        Interlocked.Exchange(ref partialWrite, 1);
+        Interlocked.Exchange(ref armed, 0);
+        Interlocked.Increment(ref repairFailures);
+    }
+
+    private void TryRepair(byte[] fov, byte[] scale, byte[] mask,
+                           byte[] beforeScale, byte[] beforeMask, byte[] scratch8, byte[] scratch4) {
+        if (Volatile.Read(ref armed) == 0) return;
+        if (!Monitor.TryEnter(gate)) return;
+        try {
+            if (Volatile.Read(ref armed) == 0 || stop.WaitOne(0)) return;
+            if (!DeviceStillCurrent(scratch8)) return;
+
+            // PREFLIGHT: all of it, or none of it. A block that is half built can
+            // have a plausible mask next to an all-zero scale, and writing just the
+            // mask would be exactly the thing this guard is not allowed to do.
+            // Field of view is only ever a gate here; it is never written.
+            if (!ReadExact(device + fovOffset, fov)     || !FloatsInRange(fov,   4,  0.2f,  3.0f)) return;
+            if (!ReadExact(device + scaleOffset, scale) || !FloatsInRange(scale, 4, 0.05f, 20.0f)) return;
+            if (!ReadExact(device + maskOffset, mask)   || !FloatsInRange(mask,  2, -0.01f, 4.0f)) return;
+
+            // RepairField validates again on the bytes it reads itself, immediately
+            // before each write. The two checks are not redundant: this one decides
+            // whether a repair may happen at all, that one closes the gap between
+            // the decision and the write.
+            int rs = RepairField(device + scaleOffset, expectedScale, scale, beforeScale,
+                                 4, 0.05f, 20.0f, scratch8);
+            bool wrote = (rs == FIELD_WRITTEN);
+            int rm = FIELD_SKIPPED;
+            // Only OK or WRITTEN may continue. If scale was skipped, something
+            // changed under us between the preflight and the write, and the mask
+            // is not touched either.
+            if (rs == FIELD_OK || rs == FIELD_WRITTEN) {
+                rm = RepairField(device + maskOffset, expectedMask, mask, beforeMask,
+                                 2, -0.01f, 4.0f, scratch8);
+                wrote = wrote || (rm == FIELD_WRITTEN);
+            }
+
+            // Anything we really wrote is recorded BEFORE a fault can return, so a
+            // verified write is never lost because the other field went wrong.
+            if (wrote) {
+                Interlocked.Increment(ref repairs);
+                // Sampled here, not on the WinForms thread later.
+                if (ReadExact(device + transitionOffset, scratch4) &&
+                    BitConverter.ToUInt32(scratch4, 0) == 3) {
+                    Interlocked.Exchange(ref transition3Repair, 1);
+                }
+            }
+
+            if (rs == FIELD_UNKNOWN || rm == FIELD_UNKNOWN) { Fault(); return; }
+            if (rs == FIELD_UNCHANGED || rm == FIELD_UNCHANGED) {
+                Interlocked.Increment(ref repairFailures);
+            }
+        } catch {
+            Interlocked.Increment(ref repairFailures);
+        } finally {
+            Monitor.Exit(gate);
+        }
+    }
+
+    private ManualResetEvent CreateTick() {
+        IntPtr raw = HmFix.CreateWaitableTimerExW(IntPtr.Zero, null,
+            HmFix.CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, HmFix.TIMER_ALL_ACCESS);
+        if (raw == IntPtr.Zero) return null;
+        long due = -10000;   // 1 ms, relative
+        if (!HmFix.SetWaitableTimer(raw, ref due, 1, IntPtr.Zero, IntPtr.Zero, false)) {
+            new SafeWaitHandle(raw, true).Dispose();
+            return null;
+        }
+        ManualResetEvent tick = new ManualResetEvent(false);
+        tick.SafeWaitHandle = new SafeWaitHandle(raw, true);
+        Interlocked.Exchange(ref highResolution, 1);
+        return tick;
+    }
+
     private void Run() {
+        byte[] fov = new byte[16];
         byte[] scale = new byte[16];
         byte[] mask = new byte[8];
+        byte[] beforeScale = new byte[16];
+        byte[] beforeMask = new byte[8];
+        byte[] scratch8 = new byte[8];
+        byte[] scratch4 = new byte[4];
+        ManualResetEvent tick = null;
+        WaitHandle[] waits = null;
+        Stopwatch watch = Stopwatch.StartNew();
+        long last = 0;
         try {
-            while (!stop.WaitOne(1)) {
+            try { tick = CreateTick(); } catch { tick = null; }
+            if (tick != null) waits = new WaitHandle[] { stop, tick };
+            ready.Set();
+            // Start the interval clock here, so timer creation and thread start-up
+            // are not reported as a slow poll.
+            last = watch.ElapsedTicks;
+            while (true) {
+                if (waits != null) {
+                    if (WaitHandle.WaitAny(waits) == 0) break;
+                } else {
+                    if (stop.WaitOne(1)) break;
+                }
+
+                long now = watch.ElapsedTicks;
+                long us = (now - last) * 1000000L / Stopwatch.Frequency;
+                last = now;
+                if (us > 4000) Interlocked.Increment(ref slowIntervals);
+                if (us > Interlocked.Read(ref maxIntervalMicroseconds)) {
+                    Interlocked.Exchange(ref maxIntervalMicroseconds, us);
+                }
+
                 bool scaleRead = ReadExact(device + scaleOffset, scale);
                 bool maskRead = scaleRead && ReadExact(device + maskOffset, mask);
                 if (!scaleRead || !maskRead) {
@@ -258,6 +530,7 @@ public sealed class RendererValueGuard : IDisposable {
                 Interlocked.Increment(ref reads);
                 if (EqualBytes(scale, expectedScale) && EqualBytes(mask, expectedMask)) continue;
                 Interlocked.Increment(ref mismatches);
+                TryRepair(fov, scale, mask, beforeScale, beforeMask, scratch8, scratch4);
                 if (Interlocked.CompareExchange(ref signalPending, 1, 0) != 0) continue;
                 try {
                     if (stop.WaitOne(0) || dispatcher.IsDisposed || !dispatcher.IsHandleCreated) {
@@ -271,6 +544,8 @@ public sealed class RendererValueGuard : IDisposable {
             }
         } finally {
             Interlocked.Exchange(ref stopped, 1);
+            ready.Set();
+            if (tick != null) { try { tick.Close(); } catch { } }
         }
     }
 
@@ -287,6 +562,7 @@ public sealed class RendererValueGuard : IDisposable {
     public void Dispose() {
         Stop(2000);
         stop.Dispose();
+        ready.Dispose();
     }
 }
 '@ -ReferencedAssemblies @("System.Windows.Forms")
@@ -330,6 +606,15 @@ $VERIFIED_VIEW_COUNT =
   [pscustomobject]@{ Name="v1.3 view count"
                      RVA=0x01161FE9L
                      Stock=[byte[]](0x80,0xB8,0x1B,0x03,0x00,0x00,0x00)
+                     Fix  =[byte[]](0x48,0x85,0xE4,0x90,0x90,0x90,0x90) }
+
+# The same 1/2/4 view count is set up in a SECOND place. v1.3 patched one of
+# them; the other kept pushing 2 and produced the oval mask on one eye. Same
+# instruction shape, same reasoning, same fix - see HOW-IT-WORKS.md section 3.
+$VERIFIED_VIEW_COUNT_2 =
+  [pscustomobject]@{ Name="v1.5 view count 2"
+                     RVA=0x01162E3CL
+                     Stock=[byte[]](0x80,0xB9,0x1B,0x03,0x00,0x00,0x00)
                      Fix  =[byte[]](0x48,0x85,0xE4,0x90,0x90,0x90,0x90) }
 
 # Most experimental sites below take one locally WNO-dependent producer or
@@ -512,7 +797,7 @@ $VERIFIED_DIAGNOSTIC_CONTEXTS = @(
 )
 
 $COMMON_TWO_LAYER_CODE = @($VERIFIED_WNO_WRITERS) + @($VERIFIED_PRIMARY_DEPTH_CB)
-$BASELINE_CODE = @($COMMON_TWO_LAYER_CODE) + @($VERIFIED_VIEW_COUNT)
+$BASELINE_CODE = @($COMMON_TWO_LAYER_CODE) + @($VERIFIED_VIEW_COUNT) + @($VERIFIED_VIEW_COUNT_2)
 $CORE_VIEW_EXTENSION = @($CAMERA_RECORDS_4) + @($CORE_DRAW_GATES_4) + @($OCCLUDER_STATE_4)
 $LEGACY_TESTKIT3_SITES = @($REFRACTION_DEPTH_ZERO) + @($CAMERA_STATE_4) + @($ASSAO_DEPTH_4) + @($SSR_FRUSTA_4) + @($CORE_VIEW_EXTENSION)
 $ALL_PROFILE_SITES = @($VERIFIED_VIEW_COUNT) + @($CULL_SCATTER_4) + @($LEGACY_TESTKIT3_SITES)
@@ -556,6 +841,9 @@ $SIGS = @(
   [pscustomobject]@{ Hit=12; Fix=[byte[]](0x48,0x85,0xE4,0x90,0x90,0x90,0x90)
     Pattern="74 16 49 8B 85 A0 41 01 00 41 8B CF 80 B8 1B 03 00 00 00 0F 45 CF"
     What="view count 4 - without this, geometry disappears" }
+  [pscustomobject]@{ Hit=9;  Fix=[byte[]](0x48,0x85,0xE4,0x90,0x90,0x90,0x90)
+    Pattern="49 8B 8D A0 41 01 00 74 1A 80 B9 1B 03 00 00 00 BF 02 00 00"
+    What="view count 4, second site - without this, one eye keeps an oval mask" }
 )
 
 # The production transparency fix is located independently of the five v1.3
@@ -1076,6 +1364,8 @@ $script:fatal=""; $script:stopped=$false
 $script:renderSyncGate=New-Object object
 $script:rendererGuard=$null
 $script:guardWritePending=$false
+$script:guardDirectRepair=$false
+$script:lastGuardRepairs=0L
 $script:guardReloadLatch=$false; $script:guardReloadSawNon3=$false
 $script:guardError=""; $script:lastGuardWriteLog=[DateTime]::MinValue
 
@@ -1083,10 +1373,11 @@ function Stop-RendererGuard {
     $guard=$script:rendererGuard
     if ($null -eq $guard) { return $true }
     try {
+        try { $guard.Disarm() } catch {}
         if (-not $guard.Stop(2000)) {
             $script:fatal="The continuous renderer guard did not stop in time. Close HITMAN before continuing."
             return $false }
-        Log ("renderer guard stopped; reads={0}, mismatches={1}, readFailures={2}" -f $guard.Reads,$guard.Mismatches,$guard.ReadFailures)
+        Log ("renderer guard stopped; reads={0}, mismatches={1}, repairs={2}, repairFailures={3}, readFailures={4}, highResTimer={5}, slowIntervals={6}, maxInterval={7} us" -f $guard.Reads,$guard.Mismatches,$guard.Repairs,$guard.RepairFailures,$guard.ReadFailures,$guard.HighResolutionTimer,$guard.SlowIntervals,$guard.MaxIntervalMicroseconds)
         $script:rendererGuard=$null
         $guard.Dispose()
         return $true
@@ -1094,6 +1385,34 @@ function Stop-RendererGuard {
         $script:fatal=("The continuous renderer guard could not be stopped safely: {0}. Close HITMAN." -f $_.Exception.Message)
         return $false
     }
+}
+
+# The guard's own bookkeeping must not depend on BeginInvoke arriving. While a
+# callback is running, signalPending stays set and a second repair queues no
+# second callback - and if the values are correct afterwards there may never be
+# another mismatch to trigger one. So this drains the counters, and the 15 ms
+# loop calls it every tick regardless of whether a callback happened.
+function Update-RendererGuardState {
+    $g=$script:rendererGuard
+    if ($null -eq $g) { return }
+    try {
+        if ($g.ConsumePartialWriteFault()) {
+            $script:guardError="A renderer value was left in an unknown state after a partial write. Close HITMAN."
+            return }
+        $r=$g.Repairs
+        $observed=($r -ne $script:lastGuardRepairs)
+        if ($observed) {
+            $script:lastGuardRepairs=$r
+            $script:guardDirectRepair=$true }
+        if ($g.ConsumeTransition3Repair()) {
+            $script:guardReloadLatch=$true
+            $script:guardReloadSawNon3=$false }
+        if ($observed) {
+            $now=Get-Date
+            if (($now-$script:lastGuardWriteLog).TotalSeconds -ge 1) {
+                Log ("1 ms renderer guard repaired directly; repairs={0}, repairFailures={1}" -f $r,$g.RepairFailures)
+                $script:lastGuardWriteLog=$now } }
+    } catch {}
 }
 
 function Invoke-RendererGuardSignal { param([RendererValueGuard]$Source)
@@ -1107,21 +1426,27 @@ function Invoke-RendererGuardSignal { param([RendererValueGuard]$Source)
         # This is intentionally the complete v1.3 transaction, not a guard-
         # specific write shortcut. It validates FOV/scale/mask, captures
         # ownership, verifies both writes and rolls back failures.
+        # Direct-repair bookkeeping lives in one place and does not depend on this
+        # callback running at all.
+        Update-RendererGuardState
+        if ($script:guardError) { return }
+
+        # What is left here is the fallback: whatever the guard could not fix on
+        # its own thread goes through the full validated transaction.
         $sync=Sync-RenderValues $script:dev
         if ($sync.Wrote) {
             try { $transition=U32 $script:handle ($script:dev+$OFF_TRANS) }
             catch { $transition=-1 }
+            # Only a write PowerShell just made may be classified with the
+            # transition PowerShell just read.
             $script:guardWritePending=$true
             if ($transition -eq 3) {
                 $script:guardReloadLatch=$true
-                $script:guardReloadSawNon3=$false
-            }
+                $script:guardReloadSawNon3=$false }
             $now=Get-Date
-            if (($now-$script:lastGuardWriteLog).TotalSeconds -ge 1) {
-                Log ("1 ms renderer guard corrected values, transition={0}" -f $transition)
-                $script:lastGuardWriteLog=$now
-            }
-        }
+            if (($now-$script:lastWriteLog).TotalSeconds -ge 1) {
+                Log ("renderer guard fallback wrote values, transition={0}" -f $transition)
+                $script:lastWriteLog=$now } }
         if ($sync.Error) {
             $script:guardError=$sync.Error
             return
@@ -1141,11 +1466,31 @@ function Ensure-RendererGuard { param([Int64]$Device)
     }
     try {
         [Action[RendererValueGuard]]$callback={ param([RendererValueGuard]$source) Invoke-RendererGuardSignal $source }
+        # The address that HOLDS the device pointer, and the vtable value the
+        # device must still have. The guard re-checks both before it writes, so a
+        # device released between two 15 ms ticks cannot be written to.
+        if ($script:mode -eq "verified") {
+            $devicePointer=$script:base+$MANAGER_RVA+$MANAGER_DEVICE_OFFSET
+        } else {
+            $devicePointer=$script:base+$script:devSlot }
+        # Fail closed: without a vtable to compare against, the guard cannot
+        # notice a released device, so it does not run at all rather than run
+        # with one safety check quietly switched off.
+        $expectedVtable=0L
+        try { $expectedVtable=I64 $script:handle $Device } catch { $expectedVtable=0L }
+        if ($expectedVtable -eq 0) {
+            $script:rendererGuard=$null
+            $script:guardError="The VR device vtable could not be read, so the renderer guard was not started."
+            return $false }
+
         $guard=[RendererValueGuard]::new(
-            $script:handle,$Device,$OFF_SCALE,$OFF_MASK,(W2B $SCALE_FIX),$MASK_FIX,$form,$callback)
+            $script:handle,$Device,$devicePointer,$expectedVtable,
+            $OFF_FOV,$OFF_SCALE,$OFF_MASK,$OFF_TRANS,(W2B $SCALE_FIX),$MASK_FIX,
+            $form,$callback,$script:renderSyncGate)
         $script:rendererGuard=$guard
+        $script:lastGuardRepairs=0L
         $guard.Start()
-        Log ("continuous 1 ms renderer guard started for device 0x{0:X}" -f $Device)
+        Log ("continuous 1 ms renderer guard started for device 0x{0:X}, highResTimer={1}" -f $Device,$guard.HighResolutionTimer)
         return $true
     } catch {
         $script:rendererGuard=$null
@@ -1165,7 +1510,7 @@ function Reset-DeviceState { param([bool]$OwnershipBecameUncertain=$false)
     $script:scaleTouched=$false; $script:maskTouched=$false
     $script:runtimeLoaded=$false; $script:lastRuntimeCheck=0L
     $script:lastWriteLog=[DateTime]::MinValue
-    $script:guardWritePending=$false
+    $script:guardWritePending=$false; $script:guardDirectRepair=$false
     $script:guardReloadLatch=$false; $script:guardReloadSawNon3=$false
     $script:guardError=""; $script:lastGuardWriteLog=[DateTime]::MinValue }
 
@@ -1217,7 +1562,7 @@ function Detach {
     $script:deviceRestoreUncertain=$false
     $script:runtimeLoaded=$false; $script:lastRuntimeCheck=0L
     $script:lastWriteLog=[DateTime]::MinValue; $script:lastUi=""
-    $script:guardWritePending=$false
+    $script:guardWritePending=$false; $script:guardDirectRepair=$false
     $script:guardReloadLatch=$false; $script:guardReloadSawNon3=$false
     $script:guardError=""; $script:lastGuardWriteLog=[DateTime]::MinValue }
 
@@ -1255,7 +1600,7 @@ function Changes-MayBeLive {
 
 # --- window ----------------------------------------------------------------
 $form=New-Object Windows.Forms.Form
-$form.Text="HitmanVRFoveationFix v1.4"
+$form.Text="HitmanVRFoveationFix v1.5"
 $form.ClientSize=New-Object Drawing.Size(520,318)
 $form.FormBorderStyle="FixedSingle"; $form.MaximizeBox=$false
 $form.StartPosition="CenterScreen"
@@ -1303,7 +1648,7 @@ $form.Controls.Add($btnStop)
 
 $link=New-Object Windows.Forms.LinkLabel
 $link.Location=New-Object Drawing.Point(240,260); $link.Size=New-Object Drawing.Size(260,22)
-$link.Text="v1.4 - project page"
+$link.Text="v1.5 - project page"
 $link.LinkArea=New-Object Windows.Forms.LinkArea(0,4)
 $link.TextAlign="MiddleRight"
 $link.Add_LinkClicked({ Start-Process "https://github.com/RealChrizzl/hitman-vr-foveation-fix" })
@@ -1584,8 +1929,19 @@ function Sync-RenderValuesCore { param([Int64]$d)
 
 function Sync-RenderValues { param([Int64]$d)
     [Threading.Monitor]::Enter($script:renderSyncGate)
-    try { return (Sync-RenderValuesCore $d) }
-    finally { [Threading.Monitor]::Exit($script:renderSyncGate) }
+    try {
+        # The guard raises its fault while holding this same lock, so anyone who
+        # acquires it afterwards is guaranteed to see it. That is what makes the
+        # unknown-state case genuinely fail closed rather than usually closed.
+        $g=$script:rendererGuard
+        if ($null -ne $g) {
+            $faulted=$false
+            try { $faulted=$g.HasFault } catch {}
+            if ($faulted) {
+                return [pscustomobject]@{ Initialized=$false; Fixed=$false; Wrote=$false
+                    Error="A renderer value was left in an unknown state after a partial write. Close HITMAN." } } }
+        return (Sync-RenderValuesCore $d)
+    } finally { [Threading.Monitor]::Exit($script:renderSyncGate) }
 }
 
 function Prepare-HookCave {
@@ -1751,7 +2107,7 @@ function Apply-Code {
     foreach ($g in $script:guardSites) {
         $cur = RB $script:handle ($script:base+$g.RVA) $g.Stock.Length
         if (-not (Same $cur $g.Stock)) {
-            $script:fatal="A guarded renderer site is not in its original state. Close HITMAN and every fix window, then start v1.4 again."
+            $script:fatal="A guarded renderer site is not in its original state. Close HITMAN and every fix window, then start v1.5 again."
             return $false } }
 
     $allFix=$true; $allStock=$true
@@ -1777,7 +2133,7 @@ function Apply-Code {
     if ($MODE_INFO.UsesHook) {
         foreach ($call in $script:hookDescriptors) {
             if (-not (Same (RB $script:handle ($script:base+$call.RVA) $call.Stock.Length) $call.Stock)) {
-                $script:fatal="A v1.4 refraction call is not in its original state. Close HITMAN and every fix window, then start v1.4 again."
+                $script:fatal="A v1.4 refraction call is not in its original state. Close HITMAN and every fix window, then start v1.5 again."
                 return $false } }
         if (-not (Prepare-HookCave)) { return $false } }
 
@@ -1901,7 +2257,7 @@ function Apply-Code {
         return $false }
     $script:writtenSites=$written
     $script:patched=$true
-    Log ("v1.4 code patched, base sites {0}, refraction calls {1}" -f $written.Count,$hookWritten.Count)
+    Log ("v1.5 code patched, base sites {0}, refraction calls {1}" -f $written.Count,$hookWritten.Count)
     return $true }
 
 # Restore renderer ownership and every code block while HITMAN is still live.
@@ -2055,7 +2411,7 @@ $timer.Add_Tick({
             $gameClosed=(-not (Game-IsAlive))
             if ($gameClosed) {
                 Log "game closed"; Detach; $script:fatal=""
-                Show-State "grey" "Waiting for HITMAN" "The game was closed. Start it again and v1.4 will apply automatically."
+                Show-State "grey" "Waiting for HITMAN" "The game was closed. Start it again and v1.5 will apply automatically."
                 $btnStop.Enabled=$false; return } }
 
         if ($script:suspendedHandles.Count -gt 0) {
@@ -2074,8 +2430,8 @@ $timer.Add_Tick({
 
         $warn=""
         if ($script:mode -eq "scanned") {
-            $warn="Untested build - every v1.3 and v1.4 code pattern was unique, but please check the image carefully." }
-        $ready="v1.4 is patched. Put on your headset, start VR as usual, then load a mission."
+            $warn="Untested build - every code pattern was unique, but please check the image carefully." }
+        $ready="v1.5 is patched. Put on your headset, start VR as usual, then load a mission."
 
         if (-not $script:patched) {
             if (-not (Apply-Code)) { return }
@@ -2147,7 +2503,12 @@ $timer.Add_Tick({
 
         $sync=Sync-RenderValues $d
         if (-not $sync.Error -and $sync.Initialized -and $sync.Fixed) {
-            Ensure-RendererGuard $d | Out-Null }
+            Ensure-RendererGuard $d | Out-Null
+            # Only now may the guard write on its own thread: both fields are
+            # owned, were written by the validated transaction and read back
+            # clean. The guard never does anything but restore these bytes.
+            if ($null -ne $script:rendererGuard -and $script:scaleTouched -and $script:maskTouched) {
+                try { $script:rendererGuard.Arm() } catch {} } }
         if ($sync.Wrote) {
             $script:pendingValueWrite=$true
             # Close the read/write race: classify the write using a fresh state
@@ -2166,9 +2527,23 @@ $timer.Add_Tick({
             Show-State "red" "Not active" "VR started before the patch could take effect. Close HITMAN, start this tool first, then the game."
             return }
 
+        # Every tick, whether or not a callback arrived.
+        Update-RendererGuardState
+        if ($script:guardError) {
+            Stop-RendererGuard | Out-Null
+            $script:fatal=("The continuous renderer guard stopped after a validated sync error: {0}" -f $script:guardError)
+            Show-State "red" "Renderer guard stopped" $script:fatal $warn
+            return }
         if ($script:guardWritePending) {
             $script:pendingValueWrite=$true
             $script:guardWritePending=$false }
+
+        # A direct repair disturbs the image, so the stable countdown restarts -
+        # but it is NOT fed to Advance-Lifecycle, because its transition was
+        # sampled by the guard and may no longer be the one we can read now.
+        if ($script:guardDirectRepair) {
+            $script:stableReady=0; $script:stableSince=0L
+            $script:guardDirectRepair=$false }
 
         $life=Advance-Lifecycle $script:lastTrans $script:needRel $trans $script:pendingValueWrite
 
@@ -2244,7 +2619,7 @@ $btnStop.Add_Click({
     Detach
     $script:stopped=$true; $script:fatal=""
     $btnStop.Enabled=$false
-    Show-State "grey" "Turned off" "Everything owned by v1.4 was restored. Close and reopen this tool to use the fix again." })
+    Show-State "grey" "Turned off" "Everything owned by v1.5 was restored. Close and reopen this tool to use the fix again." })
 
 $form.Add_FormClosing({ param($sender,$eventArgs)
     if ($script:unsafeCodeState -and (Game-IsAlive)) {
