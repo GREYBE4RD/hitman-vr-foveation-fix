@@ -61,18 +61,24 @@ The `.bat` file only launches `HitmanVRFoveationFix.ps1` with the required privi
 
 ## Linux / Proton
 
-The Linux port is experimental and currently based on **Windows v1.3**. It does **not** yet include the Windows v1.4 transparency/refraction changes or the v1.5 second-view-count and direct-write-guard changes. The Linux files remain available in the repository and are not bundled into the Windows v1.5 release ZIP.
+The experimental Linux/Python port is currently based on **Windows v1.5** and includes the v1.4 transparency/refraction changes and the v1.5 second view-count fix. The ~1 ms renderer guard remains largely unchanged from the approach first introduced in the Linux v1.3 implementation, with v1.5 adding further validation and fail-safe handling around the same basic mechanism.
 
-Development and testing of the Linux port were done by **GREYBE4RD**, with assistance from ChatGPT, on Arch Linux / SwayWM / Wayland, SteamVR and an AMD Radeon RX 9070 XT.
+The Linux implementation uses the same underlying HITMAN renderer patches and values as the Windows version, with Linux-specific process-memory, thread-control and executable-memory handling for Proton. The Linux files remain available separately in the repository and are not bundled into the Windows release ZIP.
 
-To run it:
+Development and testing of the Linux port were carried out by **GREYBE4RD**, with assistance from ChatGPT, on Arch Linux / SwayWM / Wayland, SteamVR and an AMD Radeon RX 9070 XT. While the port should be largely distro and hardware-agnostic, behaviour on other distributions, desktop environments, hardware configurations and VR setups may vary.
+
+**To run it:**
+
+1. Download the .sh and .py files to the same directory.
+2. Start your terminal of choice and make the .sh file executable and run it:
 
 ```bash
-chmod +x launch.linux.HitmanVRFoveationFix-v1.3.sh
-./launch.linux.HitmanVRFoveationFix-v1.3.sh
+chmod +x launch.linux.HitmanVRFoveationFix-v1.5.sh
+./launch.linux.HitmanVRFoveationFix-v1.5.sh
 ```
 
-Enter the `sudo` password when prompted, start HITMAN, and leave the terminal open while playing. Press `Ctrl+C` to stop the tool and restore live changes when safe.
+3. Enter the `sudo` password when prompted.
+4. Start HITMAN, and leave the terminal open while playing. Press `Ctrl+C` to stop the tool and restore live changes when safe.
 
 ## What the fix changes
 
