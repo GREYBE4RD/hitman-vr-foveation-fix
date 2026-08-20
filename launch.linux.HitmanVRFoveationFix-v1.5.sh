@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# HitmanVRFoveationFix for Linux/Proton - iteration v1.5
+# HitmanVRFoveationFix for Linux/Proton - iteration v1.5.1
 # Direct port of RealChrizzl's Windows PowerShell v1.5 implementation.
 
 set -euo pipefail

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Linux port developed with assistance from ChatGPT.
 """
-HitmanVRFoveationFix v1.5.0 - Linux/Proton port
+HitmanVRFoveationFix v1.5.1 - Linux/Proton port
 
 Based on RealChrizzl's Windows/PowerShell v1.5 implementation.
 
@@ -45,7 +45,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-FIX_VERSION = "1.5.0"
+FIX_VERSION = "1.5.1"
 UPSTREAM_VERSION = "1.5"
 
 # ===========================================================================
@@ -297,6 +297,8 @@ PTRACE_GETREGS = 12
 PTRACE_SETREGS = 13
 PTRACE_ATTACH = 16
 PTRACE_DETACH = 17
+PTRACE_SETOPTIONS = 0x4200
+PTRACE_O_EXITKILL = 0x00100000
 WAIT_WALL = 0x40000000
 
 SYS_MMAP = 9
@@ -387,6 +389,11 @@ class ThreadStopSet:
                     try:
                         ptrace(PTRACE_ATTACH, tid)
                         wait_stopped(tid)
+                        # If this tracer dies while HITMAN is deliberately
+                        # suspended, the kernel must kill the tracee rather
+                        # than detach it back into a potentially unknown
+                        # partially-patched state.
+                        ptrace(PTRACE_SETOPTIONS, tid, 0, PTRACE_O_EXITKILL)
                     except OSError as exc:
                         if exc.errno in (errno.ESRCH, errno.ECHILD):
                             continue
@@ -464,7 +471,18 @@ class ThreadStopSet:
             status = wait_stopped(tid)
             if not os.WIFSTOPPED(status):
                 raise FixError("remote syscall thread did not stop")
+            stop_signal = os.WSTOPSIG(status)
+            if stop_signal != signal.SIGTRAP:
+                raise FixError(
+                    f"remote syscall stopped on unexpected signal {stop_signal}"
+                )
             after = get_regs(tid)
+            expected_rip = rip + 3  # syscall (2 bytes) + int3 (1 byte)
+            if int(after.rip) != expected_rip:
+                raise FixError(
+                    f"remote syscall SIGTRAP had unexpected RIP 0x{int(after.rip):X} "
+                    f"(expected 0x{expected_rip:X})"
+                )
             result_u = int(after.rax)
             result = ctypes.c_longlong(result_u).value
         finally:
@@ -779,6 +797,7 @@ class HitmanFix:
         self.hook_prepared = False
         self.last_hook_log = 0.0
         self.last_integrity_check = 0.0
+        self.hook_progress: dict[str, tuple[int, float]] = {}
 
         self.dev_slot = 0
         self.wno_off = VERIFIED_WNO_OFF
@@ -1577,7 +1596,60 @@ class HitmanFix:
                 return False, "hook telemetry unavailable"
             if t["bad_count"] or t["bad_state"] or t["max_top"] > 4:
                 return False, "wrapper rejected an unexpected owner/count state"
+
             now = time.monotonic()
+
+            # Match the Windows v1.5 runtime sanity checks. Balance and owner
+            # cleanup are only asserted after two stable inactive samples so
+            # an in-flight wrapper is not mistaken for corruption.
+            stable_inactive = False
+            if t["active"] == 0 and t["copy_a_active"] == 0 and t["copy_b_active"] == 0:
+                t2 = self.read_telemetry()
+                if t2 is not None:
+                    stable_inactive = (
+                        t2["active"] == 0
+                        and t2["copy_a_active"] == 0
+                        and t2["copy_b_active"] == 0
+                        and t2["calls"] == t["calls"]
+                        and t2["changed"] == t["changed"]
+                        and t2["restored"] == t["restored"]
+                        and t2["copy_a_calls"] == t["copy_a_calls"]
+                        and t2["copy_a_changed"] == t["copy_a_changed"]
+                        and t2["copy_a_restored"] == t["copy_a_restored"]
+                        and t2["copy_b_calls"] == t["copy_b_calls"]
+                        and t2["copy_b_changed"] == t["copy_b_changed"]
+                        and t2["copy_b_restored"] == t["copy_b_restored"]
+                        and t2["owner_tid"] == t["owner_tid"]
+                        and t2["owner_ctx"] == t["owner_ctx"]
+                    )
+
+            if stable_inactive:
+                if t["owner_tid"] != 0 or t["owner_ctx"] != 0:
+                    return False, "transparent-pass owner marker stayed set"
+                if t["owner_acquired"] != t["owner_released"]:
+                    return False, "transparent-pass owner acquisition was not balanced"
+                if t["changed"] != t["restored"]:
+                    return False, "outer wrapper count change was not restored"
+                if t["copy_a_changed"] != t["copy_a_restored"]:
+                    return False, "CopyA count change was not restored"
+                if t["copy_b_changed"] != t["copy_b_restored"]:
+                    return False, "CopyB count change was not restored"
+
+            active_map = {
+                "Outer": (t["active"], t["calls"] + t["restored"]),
+                "CopyA": (t["copy_a_active"], t["copy_a_calls"] + t["copy_a_restored"]),
+                "CopyB": (t["copy_b_active"], t["copy_b_calls"] + t["copy_b_restored"]),
+            }
+            for name, (active_count, progress_value) in active_map.items():
+                if active_count == 0:
+                    self.hook_progress.pop(name, None)
+                    continue
+                old = self.hook_progress.get(name)
+                if old is None or old[0] != progress_value:
+                    self.hook_progress[name] = (progress_value, now)
+                elif now - old[1] >= 10.0:
+                    return False, f"{name} wrapper stayed active without progress for ten seconds"
+
             if now - self.last_integrity_check >= 2.0:
                 for s in self.sites:
                     if self.rb(self.base + s.rva, len(s.fix)) != s.fix:
@@ -1924,6 +1996,7 @@ class HitmanFix:
         self.hook_sites = []
         self.hook_cave = 0
         self.hook_prepared = False
+        self.hook_progress = {}
         self.patched = False
         self.dev = 0
         self.last_trans = -1
@@ -1939,7 +2012,7 @@ class HitmanFix:
             self.log("game closed")
             self.detach()
             self.fatal = ""
-            self.status("Waiting for HITMAN", "Game closed. Start it again and v1.5.0 will apply automatically.")
+            self.status("Waiting for HITMAN", "Game closed. Start it again and v1.5.1 will apply automatically.")
             return
 
         if self.unsafe_code_state:
@@ -1957,7 +2030,7 @@ class HitmanFix:
         if not self.patched:
             if not self.apply_code():
                 return
-            self.status("Ready - start VR", "v1.5.0 is patched. Start VR and load a mission.")
+            self.status("Ready - start VR", "v1.5.1 is patched. Start VR and load a mission.")
             return
 
         hook_ready, hook_error = self.hook_state()
@@ -1983,7 +2056,7 @@ class HitmanFix:
             if self.dev:
                 self.log("VR device became unavailable")
                 self.reset_device(True)
-            self.status("Ready - start VR", "v1.5.0 is patched; waiting for VR.")
+            self.status("Ready - start VR", "v1.5.1 is patched; waiting for VR.")
             return
         if d != self.dev:
             if self.dev:
@@ -2068,7 +2141,7 @@ class HitmanFix:
             self.status("Renderer write failed", sync.error)
             return
         if active != 1:
-            self.status("Ready - start VR", "v1.5.0 is patched; waiting for VR.")
+            self.status("Ready - start VR", "v1.5.1 is patched; waiting for VR.")
             return
         if not sync.initialized or not sync.fixed:
             self.status("Waiting for renderer", "VR device is still initialising.")
